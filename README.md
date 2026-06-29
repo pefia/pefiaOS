@@ -1,4 +1,6 @@
-# pefiaOS
+# pefiaOS, press image below for showcase
+
+[![Watch the showcase](https://img.youtube.com/vi/JEbIDeVyaeI/maxresdefault.jpg)](https://youtu.be/JEbIDeVyaeI)
 
 A bare-metal **32-bit x86 operating system**, written from scratch in freestanding
 C and NASM — no libc, no kernel dependencies. It boots via GRUB2 into protected
