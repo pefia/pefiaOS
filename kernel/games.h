@@ -1,6 +1,6 @@
 /* kernel/games.h
  * -----------------------------------------------------------------------------
- * Five built-in games, all driven through one uniform app interface so the
+ * Seven built-in games, all driven through one uniform app interface so the
  * window manager only needs a single WIN_GAME branch:
  *
  *   GAME_FLAPPY   - Flappy Bird   (tap to flap)
@@ -8,6 +8,8 @@
  *   GAME_MARIO    - a Mario-style platform level (run, jump, stomp, flag)
  *   GAME_RAYCAST  - Maze 3D, a Wolfenstein-style raycaster (real 3D rendering)
  *   GAME_TETRIS   - Tetris        (the seven tetrominoes, line clears)
+ *   GAME_SNAKE    - Snake         (grid snake; eat apples, don't eat yourself)
+ *   GAME_BREAKOUT - Breakout      (paddle + ball vs. a wall of bricks)
  *
  * Each game composes its frame into an off-screen buffer and presents it with
  * fb_blit() for flicker-free animation. Controls use the real-time key-state
@@ -25,6 +27,8 @@ typedef enum {
     GAME_MARIO,
     GAME_RAYCAST,
     GAME_TETRIS,
+    GAME_SNAKE,
+    GAME_BREAKOUT,
     GAME_COUNT
 } GameKind;
 

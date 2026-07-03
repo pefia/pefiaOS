@@ -1,7 +1,8 @@
 /* kernel/shell.c
  * -----------------------------------------------------------------------------
  * Minimal command shell for pefiaOS, rendered on the graphical console.
- * Built-ins: help, about (neofetch-style), memtest, clear, echo.
+ * Built-ins: help, about (neofetch-style), memtest, free, uptime, history,
+ * ver, clear, echo.
  * -----------------------------------------------------------------------------
  */
 #include "shell.h"
@@ -9,6 +10,7 @@
 #include "framebuffer.h"
 #include "input.h"
 #include "heap.h"
+#include "clock.h"
 #include "sysinfo.h"
 #include "util.h"
 
@@ -114,7 +116,7 @@ static void cmd_about(void)
     con_putchar('\n');
     row("pefia", "@pefiaOS");
     row("", "---------------");
-    row("OS:      ", "pefiaOS 0.2 (Stardance)");
+    row("OS:      ", PEFIA_VERSION);
     row("Host:    ", "x86 PC - BIOS / GRUB2");
     row("Kernel:  ", "32-bit protected mode");
     row("Shell:   ", "pefia-sh");
@@ -178,12 +180,78 @@ static void cmd_memtest(void)
     con_setcolor(SH_FG, SH_BG);
 }
 
+/* Heap usage: total / used / free, plus a live percentage bar. */
+static void cmd_free(void)
+{
+    size_t total = heap_total_bytes();
+    size_t freeb = heap_free_bytes();
+    size_t used  = total - freeb;
+
+    print_bytes("heap total: ", total);
+    print_bytes("heap used:  ", used);
+    print_bytes("heap free:  ", freeb);
+
+    int pct = total ? (int)((uint64_t)used * 100 / total) : 0;
+    char num[11];
+    con_write("usage: [");
+    for (int i = 0; i < 20; i++) con_putchar(i * 5 < pct ? '#' : '-');
+    con_write("] ");
+    kutoa((uint32_t)pct, num);
+    con_write(num);
+    con_write("%\n");
+}
+
+/* Milliseconds since boot -> "up H h M m S s". */
+static void cmd_uptime(void)
+{
+    uint32_t s = clock_ms() / 1000;
+    char num[11];
+    con_write("up ");
+    kutoa(s / 3600, num);      con_write(num); con_write(" h ");
+    kutoa((s / 60) % 60, num); con_write(num); con_write(" m ");
+    kutoa(s % 60, num);        con_write(num); con_write(" s\n");
+}
+
+static void cmd_ver(void)
+{
+    con_write(PEFIA_VERSION " - 32-bit protected mode, i686\n");
+}
+
+/* --- command history (last HIST_MAX non-empty lines) --- */
+
+#define HIST_MAX 16
+static char hist[HIST_MAX][LINE_MAX];
+static int  hist_n = 0;                 /* total lines ever recorded */
+
+static void hist_add(const char *line)
+{
+    if (!line[0]) return;
+    kstrcpy(hist[hist_n % HIST_MAX], line);
+    hist_n++;
+}
+
+static void cmd_history(void)
+{
+    int first = hist_n > HIST_MAX ? hist_n - HIST_MAX : 0;
+    char num[11];
+    for (int i = first; i < hist_n; i++) {
+        kutoa((uint32_t)(i + 1), num);
+        con_write("  "); con_write(num); con_write("  ");
+        con_write(hist[i % HIST_MAX]);
+        con_putchar('\n');
+    }
+}
+
 static void cmd_help(void)
 {
     con_write("Built-in commands:\n");
     con_write("  help        show this list\n");
     con_write("  about       neofetch-style system info\n");
     con_write("  memtest     stress-test the kernel heap\n");
+    con_write("  free        heap usage (total/used/free + bar)\n");
+    con_write("  uptime      time since boot\n");
+    con_write("  history     recent commands\n");
+    con_write("  ver         OS version\n");
     con_write("  clear       clear the screen\n");
     con_write("  echo TEXT   print TEXT back\n");
 }
@@ -226,6 +294,7 @@ void shell_run(void)
         read_line(line);
 
         const char *echo_arg = str_after_prefix(line, "echo ");
+        hist_add(line);
 
         if (line[0] == '\0') {
             /* empty line */
@@ -235,8 +304,18 @@ void shell_run(void)
             cmd_about();
         } else if (str_eq(line, "memtest")) {
             cmd_memtest();
+        } else if (str_eq(line, "free")) {
+            cmd_free();
+        } else if (str_eq(line, "uptime")) {
+            cmd_uptime();
+        } else if (str_eq(line, "history")) {
+            cmd_history();
+        } else if (str_eq(line, "ver")) {
+            cmd_ver();
         } else if (str_eq(line, "clear")) {
             con_clear();
+        } else if (str_eq(line, "echo")) {
+            con_putchar('\n');           /* bare echo, like the real thing */
         } else if (echo_arg) {
             con_write(echo_arg);
             con_putchar('\n');

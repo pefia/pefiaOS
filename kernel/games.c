@@ -37,6 +37,11 @@
 #define ES     20          /* Mario enemy size    */
 #define COLS   10          /* Tetris board width  */
 #define ROWS   18          /* Tetris board height */
+#define SN_MAXW 48         /* Snake grid max width  (cells) */
+#define SN_MAXH 34         /* Snake grid max height (cells) */
+#define SN_CAP  (SN_MAXW * SN_MAXH)
+#define BK_MAXC 14         /* Breakout max brick columns */
+#define BK_MAXR 8          /* Breakout max brick rows    */
 
 typedef struct {
     int       kind;
@@ -63,6 +68,16 @@ typedef struct {
     /* --- Tetris --- */
     uint8_t t_board[ROWS * COLS];
     int     t_type, t_rot, t_x, t_y, t_acc, t_lines;
+
+    /* --- Snake --- */
+    uint16_t s_body[SN_CAP];   /* ring buffer of cell indices (y*gw + x) */
+    int      s_head, s_len, s_dir, s_pend, s_acc;
+    int      s_gw, s_gh, s_food;
+
+    /* --- Breakout --- */
+    uint8_t  k_brick[BK_MAXR * BK_MAXC];
+    int      k_rows, k_cols, k_left, k_px, k_bx, k_by, k_bvx, k_bvy;
+    int      k_lives, k_stuck;
 } Game;
 
 /* ===========================================================================
@@ -149,6 +164,7 @@ static int down_held (void) { return input_key_down(IK_DOWN)  || input_key_down(
 static int left_press (void) { return input_key_pressed(IK_LEFT)  || input_key_pressed(IK_A); }
 static int right_press(void) { return input_key_pressed(IK_RIGHT) || input_key_pressed(IK_D); }
 static int up_press   (void) { return input_key_pressed(IK_UP)    || input_key_pressed(IK_W); }
+static int down_press (void) { return input_key_pressed(IK_DOWN)  || input_key_pressed(IK_S); }
 static int space_press(void) { return input_key_pressed(IK_SPACE); }
 /* "action" used for flap/jump/restart: space or up/W */
 static int act_press  (void) { return input_key_pressed(IK_SPACE) ||
@@ -800,8 +816,332 @@ static void tetris_overlay(Game *g, int cx, int cy)
     label(cx + 8, cy + 6, b, fb_rgb(255, 255, 255), fb_rgb(18, 20, 30));
     numlabel(b, "Lines ", g->t_lines);
     label(cx + g->cw - 90, cy + 6, b, fb_rgb(180, 220, 255), fb_rgb(18, 20, 30));
-    if (g->over)
-        center_msg(cx, cy, g->cw, g->ch, "GAME OVER  -  SPACE", fb_rgb(255, 220, 120), fb_rgb(120, 36, 44));
+    if (g->over){
+        numlabel(b, "GAME OVER - SPACE  best ", g->best);
+        center_msg(cx, cy, g->cw, g->ch, b, fb_rgb(255,220,120), fb_rgb(120, 36, 44));
+    }
+
+}
+
+/* ===========================================================================
+ * SNAKE
+ *
+ * Classic grid snake. The body is a ring buffer of cell indices so a move is
+ * O(1): push a new head, and (unless an apple was just eaten) let the tail
+ * fall off the back. The grid is sized from the window at reset; resizing the
+ * window mid-game restarts the round on the new grid.
+ * ======================================================================== */
+
+#define SN_CELL 16                     /* pixels per grid cell */
+
+/* directions: 0=up 1=right 2=down 3=left (opposite = dir ^ 2) */
+static const int SN_DX[4] = { 0, 1, 0, -1 };
+static const int SN_DY[4] = { -1, 0, 1, 0 };
+
+static int snake_cell_used(Game *g, int cell)
+{
+    for (int i = 0; i < g->s_len; i++)
+        if (g->s_body[(g->s_head - i + SN_CAP) % SN_CAP] == cell) return 1;
+    return 0;
+}
+
+static void snake_place_food(Game *g)
+{
+    int cells = g->s_gw * g->s_gh;
+    if (g->s_len >= cells) { g->s_food = -1; return; }   /* board full: you win */
+    int c;
+    do { c = grange(0, cells); } while (snake_cell_used(g, c));
+    g->s_food = c;
+}
+
+static void snake_reset(Game *g)
+{
+    g->over = 0; g->won = 0; g->score = 0; g->s_acc = 0;
+
+    g->s_gw = g->cw / SN_CELL;
+    g->s_gh = g->ch / SN_CELL;
+    if (g->s_gw > SN_MAXW) g->s_gw = SN_MAXW;
+    if (g->s_gh > SN_MAXH) g->s_gh = SN_MAXH;
+    if (g->s_gw < 8) g->s_gw = 8;
+    if (g->s_gh < 8) g->s_gh = 8;
+
+    int cx = g->s_gw / 2, cy = g->s_gh / 2;
+    g->s_len  = 4;
+    g->s_head = 3;
+    g->s_dir  = 1;                       /* heading right */
+    g->s_pend = 1;
+    for (int i = 0; i < 4; i++)
+        g->s_body[i] = (uint16_t)(cy * g->s_gw + (cx - 3 + i));
+    snake_place_food(g);
+}
+
+static void snake_step(Game *g)
+{
+    /* restart the round if the window was resized onto a different grid */
+    int gw = g->cw / SN_CELL, gh = g->ch / SN_CELL;
+    if (gw > SN_MAXW) gw = SN_MAXW;
+    if (gh > SN_MAXH) gh = SN_MAXH;
+    if (gw < 8) gw = 8;
+    if (gh < 8) gh = 8;
+    if (gw != g->s_gw || gh != g->s_gh) { snake_reset(g); return; }
+
+    if (g->over) { if (act_press()) snake_reset(g); return; }
+
+    /* buffer the latest turn each 33 ms tick so no keypress is dropped */
+    if (up_press()    && g->s_dir != 2) g->s_pend = 0;
+    if (right_press() && g->s_dir != 3) g->s_pend = 1;
+    if (down_press()  && g->s_dir != 0) g->s_pend = 2;
+    if (left_press()  && g->s_dir != 1) g->s_pend = 3;
+
+    /* the snake itself only moves every ~60-130 ms, faster as you score */
+    int move_ms = 130 - g->score * 4;
+    if (move_ms < 60) move_ms = 60;
+    g->s_acc += 33;
+    if (g->s_acc < move_ms) return;
+    g->s_acc = 0;
+
+    if (g->s_pend != (g->s_dir ^ 2)) g->s_dir = g->s_pend;
+
+    int head = g->s_body[g->s_head];
+    int hx = head % g->s_gw + SN_DX[g->s_dir];
+    int hy = head / g->s_gw + SN_DY[g->s_dir];
+
+    if (hx < 0 || hx >= g->s_gw || hy < 0 || hy >= g->s_gh) {
+        g->over = 1; if (g->score > g->best) g->best = g->score; return;
+    }
+    int cell = hy * g->s_gw + hx;
+    int grow = (cell == g->s_food);
+
+    /* self collision: the tail cell is vacated this step unless we grow */
+    for (int i = 0; i < g->s_len - (grow ? 0 : 1); i++)
+        if (g->s_body[(g->s_head - i + SN_CAP) % SN_CAP] == cell) {
+            g->over = 1; if (g->score > g->best) g->best = g->score; return;
+        }
+
+    g->s_head = (g->s_head + 1) % SN_CAP;
+    g->s_body[g->s_head] = (uint16_t)cell;
+    if (grow) {
+        g->s_len++; g->score++;
+        snake_place_food(g);
+        if (g->s_food < 0) {             /* filled the whole board */
+            g->won = 1; g->over = 1;
+            if (g->score > g->best) g->best = g->score;
+        }
+    }
+}
+
+static void snake_draw(Game *g)
+{
+    int ox = (g->cw - g->s_gw * SN_CELL) / 2;
+    int oy = (g->ch - g->s_gh * SN_CELL) / 2;
+
+    gclear(g, fb_rgb(18, 24, 18));
+    /* checkerboard field */
+    for (int y = 0; y < g->s_gh; y++)
+        for (int x = 0; x < g->s_gw; x++)
+            gfill(g, ox + x * SN_CELL, oy + y * SN_CELL, SN_CELL, SN_CELL,
+                  ((x + y) & 1) ? fb_rgb(38, 52, 38) : fb_rgb(32, 46, 32));
+
+    /* apple */
+    if (g->s_food >= 0) {
+        int fx = ox + (g->s_food % g->s_gw) * SN_CELL;
+        int fy = oy + (g->s_food / g->s_gw) * SN_CELL;
+        gfill(g, fx + 3, fy + 3, SN_CELL - 6, SN_CELL - 6, fb_rgb(226, 62, 54));
+        gfill(g, fx + SN_CELL / 2 - 1, fy + 1, 2, 4, fb_rgb(96, 66, 32));   /* stem */
+    }
+
+    /* body, tail-to-head, shading toward the head */
+    for (int i = g->s_len - 1; i >= 0; i--) {
+        int c  = g->s_body[(g->s_head - i + SN_CAP) % SN_CAP];
+        int sx = ox + (c % g->s_gw) * SN_CELL;
+        int sy = oy + (c / g->s_gw) * SN_CELL;
+        int t  = 255 - (i * 96) / (g->s_len ? g->s_len : 1);
+        gfill(g, sx + 1, sy + 1, SN_CELL - 2, SN_CELL - 2, shade(92, 220, 92, t));
+        if (i == 0) {                                     /* head: eyes */
+            gfill(g, sx + 4, sy + 4, 3, 3, fb_rgb(16, 16, 16));
+            gfill(g, sx + SN_CELL - 7, sy + 4, 3, 3, fb_rgb(16, 16, 16));
+        }
+    }
+}
+
+static void snake_overlay(Game *g, int cx, int cy)
+{
+    char b[48];
+    numlabel(b, "Apples ", g->score);
+    label(cx + 8, cy + 6, b, fb_rgb(255, 255, 255), fb_rgb(18, 30, 18));
+    if (g->over) {
+        if (g->won)
+            center_msg(cx, cy, g->cw, g->ch, "YOU WIN!  -  SPACE",
+                       fb_rgb(255, 232, 130), fb_rgb(24, 96, 44));
+        else {
+            numlabel(b, "GAME OVER  -  SPACE   best ", g->best);
+            center_msg(cx, cy, g->cw, g->ch, b, fb_rgb(255, 232, 130), fb_rgb(120, 36, 44));
+        }
+    }
+}
+
+/* ===========================================================================
+ * BREAKOUT
+ *
+ * Paddle + ball vs. a brick wall. Ball position/velocity are 26.6 fixed point
+ * (same trick as Flappy) so slow shallow angles don't quantise to zero. The
+ * ball starts stuck to the paddle; space launches it. Three lives.
+ * ======================================================================== */
+
+static int bk_bw(Game *g) { return (g->cw - 16) / g->k_cols; }   /* brick width  */
+#define BK_BH   18                                               /* brick height */
+#define BK_TOP  36                                               /* wall y start */
+
+static void breakout_stick(Game *g)
+{
+    g->k_stuck = 1;
+    g->k_bx = (g->k_px << 6);            /* ride the paddle centre */
+    g->k_by = 0;                          /* recomputed while stuck */
+}
+
+static void breakout_reset(Game *g)
+{
+    g->over = 0; g->won = 0; g->score = 0;
+    g->k_lives = 3;
+
+    g->k_cols = g->cw / 56;
+    if (g->k_cols > BK_MAXC) g->k_cols = BK_MAXC;
+    if (g->k_cols < 6)       g->k_cols = 6;
+    g->k_rows = 6;
+
+    g->k_left = g->k_rows * g->k_cols;
+    for (int r = 0; r < g->k_rows; r++)
+        for (int c = 0; c < g->k_cols; c++)
+            g->k_brick[r * g->k_cols + c] = (uint8_t)(r + 1);
+
+    g->k_px = g->cw / 2;
+    breakout_stick(g);
+}
+
+static void breakout_launch(Game *g)
+{
+    int sp = g->cw / 160 + 3;
+    g->k_stuck = 0;
+    g->k_bvx = ((grand() & 1) ? sp : -sp) << 5;   /* half-speed x */
+    g->k_bvy = -(sp << 6);
+}
+
+static void breakout_step(Game *g)
+{
+    if (g->over) { if (act_press()) breakout_reset(g); return; }
+
+    int pw = g->cw / 6; if (pw < 56) pw = 56;     /* paddle width  */
+    int ph = 10;                                   /* paddle height */
+    int py = g->ch - 24;                           /* paddle top y  */
+    int sp = g->cw / 90 + 4;
+    if (left_held())  g->k_px -= sp;
+    if (right_held()) g->k_px += sp;
+    if (g->k_px < pw / 2)          g->k_px = pw / 2;
+    if (g->k_px > g->cw - pw / 2)  g->k_px = g->cw - pw / 2;
+
+    int r = 5;                                     /* ball radius */
+    if (g->k_stuck) {
+        g->k_bx = g->k_px << 6;
+        g->k_by = (py - r - 1) << 6;
+        if (space_press()) breakout_launch(g);
+        return;
+    }
+
+    g->k_bx += g->k_bvx;
+    g->k_by += g->k_bvy;
+    int bx = g->k_bx >> 6, by = g->k_by >> 6;
+
+    /* walls */
+    if (bx - r < 0)        { g->k_bx = (r)        << 6; g->k_bvx = -g->k_bvx; }
+    if (bx + r >= g->cw)   { g->k_bx = (g->cw - r - 1) << 6; g->k_bvx = -g->k_bvx; }
+    if (by - r < 0)        { g->k_by = (r)        << 6; g->k_bvy = -g->k_bvy; }
+
+    /* paddle: bounce angle depends on where the ball struck */
+    bx = g->k_bx >> 6; by = g->k_by >> 6;
+    if (g->k_bvy > 0 && by + r >= py && by + r < py + ph &&
+        bx >= g->k_px - pw / 2 - r && bx <= g->k_px + pw / 2 + r) {
+        int off = bx - g->k_px;                    /* -pw/2 .. +pw/2 */
+        g->k_bvy = -g->k_bvy;
+        g->k_bvx = (off << 6) / (pw / 6);
+        g->k_by  = (py - r - 1) << 6;
+    }
+
+    /* bricks: resolve against the cell the ball centre is inside */
+    int bw = bk_bw(g);
+    if (by - r < BK_TOP + g->k_rows * BK_BH && by + r >= BK_TOP) {
+        int c = (bx - 8) / bw;
+        int row = (by - BK_TOP) / BK_BH;
+        if (c >= 0 && c < g->k_cols && row >= 0 && row < g->k_rows &&
+            g->k_brick[row * g->k_cols + c]) {
+            g->k_brick[row * g->k_cols + c] = 0;
+            g->k_left--;
+            g->score += 10;
+            g->k_bvy = -g->k_bvy;
+            if (g->k_left == 0) {
+                g->won = 1; g->over = 1;
+                if (g->score > g->best) g->best = g->score;
+            }
+        }
+    }
+
+    /* floor: lose a life */
+    if (by - r > g->ch) {
+        if (--g->k_lives <= 0) {
+            g->over = 1;
+            if (g->score > g->best) g->best = g->score;
+        } else {
+            breakout_stick(g);
+        }
+    }
+}
+
+static void breakout_draw(Game *g)
+{
+    gclear(g, fb_rgb(16, 18, 30));
+
+    static const uint8_t ROWC[6][3] = {
+        { 220, 68, 58 }, { 236, 146, 52 }, { 240, 212, 72 },
+        { 96, 208, 92 }, { 84, 148, 236 }, { 156, 100, 224 },
+    };
+    int bw = bk_bw(g);
+    for (int row = 0; row < g->k_rows; row++)
+        for (int c = 0; c < g->k_cols; c++) {
+            uint8_t v = g->k_brick[row * g->k_cols + c];
+            if (!v) continue;
+            const uint8_t *rc = ROWC[(v - 1) % 6];
+            int x = 8 + c * bw, y = BK_TOP + row * BK_BH;
+            gfill(g, x + 1, y + 1, bw - 2, BK_BH - 2, fb_rgb(rc[0], rc[1], rc[2]));
+            gfill(g, x + 1, y + 1, bw - 2, 3, shade(rc[0], rc[1], rc[2], 160)); /* bevel */
+        }
+
+    int pw = g->cw / 6; if (pw < 56) pw = 56;
+    int py = g->ch - 24;
+    gfill(g, g->k_px - pw / 2, py, pw, 10, fb_rgb(210, 216, 235));
+    gfill(g, g->k_px - pw / 2, py, pw, 3,  fb_rgb(240, 244, 255));
+
+    int r = 5, bx = g->k_bx >> 6, by = g->k_by >> 6;
+    gfill(g, bx - r, by - r, 2 * r, 2 * r, fb_rgb(255, 235, 130));
+}
+
+static void breakout_overlay(Game *g, int cx, int cy)
+{
+    char b[48];
+    numlabel(b, "Score ", g->score);
+    label(cx + 8, cy + 6, b, fb_rgb(255, 255, 255), fb_rgb(18, 20, 30));
+    numlabel(b, "Lives ", g->k_lives);
+    label(cx + g->cw - 90, cy + 6, b, fb_rgb(180, 220, 255), fb_rgb(18, 20, 30));
+    if (g->over) {
+        if (g->won)
+            center_msg(cx, cy, g->cw, g->ch, "YOU WIN!  -  SPACE",
+                       fb_rgb(255, 232, 130), fb_rgb(24, 96, 44));
+        else {
+            numlabel(b, "GAME OVER  -  SPACE   best ", g->best);
+            center_msg(cx, cy, g->cw, g->ch, b, fb_rgb(255, 232, 130), fb_rgb(120, 36, 44));
+        }
+    } else if (g->k_stuck) {
+        center_msg(cx, cy, g->cw, g->ch, "SPACE TO LAUNCH",
+                   fb_rgb(220, 230, 250), fb_rgb(40, 48, 76));
+    }
 }
 
 /* ===========================================================================
@@ -816,6 +1156,8 @@ static void game_reset(Game *g)
     case GAME_MARIO:   mario_reset(g);   break;
     case GAME_RAYCAST: raycast_reset(g); break;
     case GAME_TETRIS:  tetris_reset(g);  break;
+    case GAME_SNAKE:   snake_reset(g);   break;
+    case GAME_BREAKOUT: breakout_reset(g); break;
     default: break;
     }
 }
@@ -828,6 +1170,8 @@ static void game_advance(Game *g)
     case GAME_MARIO:   mario_step(g);   break;
     case GAME_RAYCAST: raycast_step(g); break;
     case GAME_TETRIS:  tetris_step(g);  break;
+    case GAME_SNAKE:   snake_step(g);   break;
+    case GAME_BREAKOUT: breakout_step(g); break;
     default: break;
     }
 }
@@ -840,6 +1184,8 @@ static void game_compose(Game *g)
     case GAME_MARIO:   mario_draw(g);   break;
     case GAME_RAYCAST: raycast_draw(g); break;
     case GAME_TETRIS:  tetris_draw(g);  break;
+    case GAME_SNAKE:   snake_draw(g);   break;
+    case GAME_BREAKOUT: breakout_draw(g); break;
     default: gclear(g, fb_rgb(0, 0, 0)); break;
     }
 }
@@ -852,6 +1198,8 @@ static void game_overlay(Game *g, int cx, int cy)
     case GAME_MARIO:   mario_overlay(g, cx, cy);   break;
     case GAME_RAYCAST: raycast_overlay(g, cx, cy); break;
     case GAME_TETRIS:  tetris_overlay(g, cx, cy);  break;
+    case GAME_SNAKE:   snake_overlay(g, cx, cy);   break;
+    case GAME_BREAKOUT: breakout_overlay(g, cx, cy); break;
     default: break;
     }
 }
@@ -864,6 +1212,8 @@ static uint32_t game_step_ms(Game *g)
     case GAME_MARIO:   return 22;
     case GAME_RAYCAST: return 33;
     case GAME_TETRIS:  return 33;
+    case GAME_SNAKE:   return 33;
+    case GAME_BREAKOUT: return 16;
     default: return 33;
     }
 }
@@ -908,6 +1258,8 @@ const char *game_title(int kind)
     case GAME_MARIO:   return "Mario";
     case GAME_RAYCAST: return "Maze 3D";
     case GAME_TETRIS:  return "Tetris";
+    case GAME_SNAKE:   return "Snake";
+    case GAME_BREAKOUT: return "Breakout";
     default: return "Game";
     }
 }

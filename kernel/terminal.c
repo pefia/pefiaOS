@@ -7,6 +7,8 @@
 #include "wm.h"
 #include "vfs.h"
 #include "heap.h"
+#include "clock.h"
+#include "sysinfo.h"
 #include "framebuffer.h"
 #include "console.h"
 #include "util.h"
@@ -72,7 +74,7 @@ static void exec(Term *t)
     if (cmd[0] == '\0') {
         /* nothing */
     } else if (streq(cmd, "help")) {
-        push(t, "commands: help  ls  cat <file>  echo <text>  about  meminfo  clear");
+        push(t, "commands: help  ls  cat <file>  echo <text>  about  meminfo  uptime  clear");
     } else if (streq(cmd, "ls")) {
         int kids[64];
         int n = vfs_children(vfs_root(), kids, 64);
@@ -100,7 +102,7 @@ static void exec(Term *t)
     } else if ((arg = afterpfx(cmd, "echo ")) != 0) {
         push(t, arg);
     } else if (streq(cmd, "about")) {
-        push(t, "pefiaOS 0.3 Stardance - 32-bit hobby OS");
+        push(t, PEFIA_VERSION " - 32-bit hobby OS");
     } else if (streq(cmd, "meminfo")) {
         char line[80], num[12];
         int q = 0;
@@ -114,6 +116,23 @@ static void exec(Term *t)
         for (int i = 0; num[i]; i++) line[q++] = num[i];
         const char *l3 = " bytes";
         for (int i = 0; l3[i]; i++) line[q++] = l3[i];
+        line[q] = '\0';
+        push(t, line);
+    } else if (streq(cmd, "uptime")) {
+        char line[80], num[12];
+        int q = 0;
+        uint32_t s = clock_ms() / 1000;
+        const char *l = "up ";
+        for (int i = 0; l[i]; i++) line[q++] = l[i];
+        kutoa(s / 3600, num);
+        for (int i = 0; num[i]; i++) line[q++] = num[i];
+        line[q++] = 'h'; line[q++] = ' ';
+        kutoa((s / 60) % 60, num);
+        for (int i = 0; num[i]; i++) line[q++] = num[i];
+        line[q++] = 'm'; line[q++] = ' ';
+        kutoa(s % 60, num);
+        for (int i = 0; num[i]; i++) line[q++] = num[i];
+        line[q++] = 's';
         line[q] = '\0';
         push(t, line);
     } else if (streq(cmd, "clear")) {

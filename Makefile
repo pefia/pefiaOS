@@ -9,7 +9,7 @@
 CC  := i686-elf-gcc
 AS  := nasm
 
-CFLAGS  := -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Ikernel
+CFLAGS  := -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Ikernel -MMD -MP
 LDFLAGS := -ffreestanding -O2 -nostdlib -T linker.ld
 LDLIBS  := -lgcc
 
@@ -110,4 +110,9 @@ run-net: $(ISO)
 clean:
 	rm -rf $(BUILD) $(ISO) $(ISODIR)/boot/pefiaos.bin
 
-.PHONY: all run clean
+# Compiler-generated header dependencies (-MMD): editing any kernel/*.h now
+# rebuilds exactly the objects that include it, instead of needing a full
+# `make clean` for the change to be picked up.
+-include $(OBJS:.o=.d)
+
+.PHONY: all run run-net clean

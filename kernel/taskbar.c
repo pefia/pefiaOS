@@ -27,9 +27,10 @@ static int  searchlen = 0;
 
 static const char *APPS[] = {
     "File Explorer", "Terminal", "Notepad", "Browser",
-    "Flappy Bird", "Pong", "Mario", "Maze 3D", "Tetris", "DOOM"
+    "Flappy Bird", "Pong", "Mario", "Maze 3D", "Tetris",
+    "Snake", "Breakout", "DOOM"
 };
-#define NAPPS 10
+#define NAPPS 12
 
 typedef struct { char label[40]; int kind; int arg; } Item;  /* kind 0=app, 1=file */
 
@@ -79,8 +80,10 @@ static void launch_app(int a)
     else if (a == 5) wm_create_game(GAME_PONG,    120, 80, 660, 460);
     else if (a == 6) wm_create_game(GAME_MARIO,    80, 70, 820, 470);
     else if (a == 7) wm_create_game(GAME_RAYCAST, 130, 70, 680, 520);
-    else if (a == 8) wm_create_game(GAME_TETRIS,  220, 50, 460, 640);
-    else if (a == 9) wm_create_doom(70, 40, 656, 452);
+    else if (a == 8)  wm_create_game(GAME_TETRIS,   220, 50, 460, 640);
+    else if (a == 9)  wm_create_game(GAME_SNAKE,    160, 60, 560, 500);
+    else if (a == 10) wm_create_game(GAME_BREAKOUT, 150, 70, 620, 480);
+    else if (a == 11) wm_create_doom(70, 40, 656, 452);
 }
 
 static void draw_clip(int x, int y, const char *s, int maxcols, color_t fg, color_t bg)
