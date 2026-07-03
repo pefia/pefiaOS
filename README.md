@@ -6,7 +6,7 @@ A bare-metal **32-bit x86 operating system**, written from scratch in freestandi
 C and NASM — no libc, no kernel dependencies. It boots via GRUB2 into protected
 mode, brings up a VESA framebuffer, and runs a mouse-driven **graphical desktop**
 with overlapping windows. On top of that it has a **from-scratch TCP/IP + TLS 1.3
-network stack and web browser** that loads real HTTPS sites, **five built-in
+network stack and web browser** that loads real HTTPS sites, **seven built-in
 games**, and — yes — **the actual id Software DOOM**.
 
 > Build: WSL2 Ubuntu + an `i686-elf` cross-compiler → `make` → a bootable
@@ -23,14 +23,13 @@ games**, and — yes — **the actual id Software DOOM**.
 - **A web browser** — HTTP/1.1 with redirects + chunked decoding, an HTML5
   renderer with links, lists, inline CSS colour, and inline images (BMP + JPEG
   decoded by hand).
-- **Five games** — Flappy Bird, Pong, a Mario-style platformer, a 3D raycaster
-  maze, and Tetris — all flicker-free and resizable.
+- **Seven games** — Flappy Bird, Pong, a Mario-style platformer, a 3D raycaster
+  maze, Tetris, Snake, and Breakout — all flicker-free and resizable.
 - **It runs DOOM** — the real 1993 DOOM via [PureDOOM](https://github.com/Daivuk/PureDOOM),
   with the shareware WAD embedded right in the kernel image.
 
 All of it is roughly **9k lines of kernel C** plus the boot stub (and the vendored
-DOOM engine). See **[DEVLOG.md](DEVLOG.md)** for the full build-order story and
-**[DEVLOG-GAMES.md](DEVLOG-GAMES.md)** for the games + DOOM deep-dive.
+DOOM engine).
 
 ## Directory layout
 
@@ -55,7 +54,7 @@ pefiaOS/
 │   ├── crypto.*, tls.*      # SHA-256/HKDF/AES-GCM/X25519 + TLS 1.3 client
 │   ├── browser.*, htmlrender.*, css.*, domparse.*, domrt.*, js.*   # the browser
 │   ├── inflate.*, bitmap.*, jpeg.*, image.*   # DEFLATE + image decoders
-│   ├── games.*              # Flappy Bird, Pong, Mario, Maze 3D, Tetris
+│   ├── games.*              # Flappy Bird, Pong, Mario, Maze 3D, Tetris, Snake, Breakout
 │   └── PureDOOM.h, puredoom.c, doom_app.*   # DOOM engine + pefiaOS platform layer
 ├── iso/boot/grub/grub.cfg   # GRUB menu (multiboot /boot/pefiaos.bin)
 └── toolchain/
@@ -130,7 +129,7 @@ Enter. The stack is entirely from-scratch:
 
 ## Games
 
-Five games launch from the Start menu — each runs in a resizable window and
+Seven games launch from the Start menu — each runs in a resizable window and
 animates flicker-free via an off-screen buffer.
 
 | Game        | Controls |
@@ -140,6 +139,8 @@ animates flicker-free via an off-screen buffer.
 | Mario       | **←/→** or **A/D** to run, **Space/Up/W** to jump |
 | Maze 3D     | **W/S** or **↑/↓** move, **A/D** or **←/→** turn (a from-scratch raycaster) |
 | Tetris      | **←/→** move, **Up/W** rotate, **Down/S** soft drop, **Space** hard drop |
+| Snake       | **Arrows** or **WASD** to steer, eat apples to grow |
+| Breakout    | **←/→** or **A/D** to move the paddle, **Space** to launch |
 
 After a game over, press **Space** to restart.
 
