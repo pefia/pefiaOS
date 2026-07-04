@@ -1,8 +1,6 @@
 /* kernel/sysinfo.h
- * -----------------------------------------------------------------------------
- * A couple of system facts gathered at boot (from Multiboot) for `about`.
- * -----------------------------------------------------------------------------
- */
+ * A couple of facts gathered at boot that the `about` command likes to show
+ * off - total RAM and the version string, both defined once here. */
 #ifndef PEFIA_SYSINFO_H
 #define PEFIA_SYSINFO_H
 

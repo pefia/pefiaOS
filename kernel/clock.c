@@ -1,9 +1,9 @@
 #include "clock.h"
 #include "rtc.h"
 
-static uint64_t g_cycles_per_ms = 0;
-static uint64_t g_base_tsc      = 0;
-static int      g_ready         = 0;
+static uint64_t tsc_cycles_per_ms = 0;
+static uint64_t tsc_base          = 0;
+static int      calibrated        = 0;
 
 static int rtc_seconds(void)
 {
@@ -14,33 +14,34 @@ static int rtc_seconds(void)
 
 void clock_init(void)
 {
-    if (g_ready) return;
+    if (calibrated) return;
 
-    /* Wait for the RTC second to tick over, then count TSC cycles across one
-     * full second. This gives cycles-per-second without any timer hardware. */
-    int s0 = rtc_seconds();
-    int s1;
-    do { s1 = rtc_seconds(); } while (s1 == s0);
+    /* No timer hardware means no interrupt to count cycles-per-tick
+     * against, so instead we wait for the RTC's seconds field to roll
+     * over and count TSC cycles across exactly one full second of it. */
+    int prev = rtc_seconds();
+    int cur;
+    do { cur = rtc_seconds(); } while (cur == prev);
 
-    uint64_t t1 = rdtsc();
-    int s2;
-    do { s2 = rtc_seconds(); } while (s2 == s1);
-    uint64_t t2 = rdtsc();
+    uint64_t t_start = rdtsc();
+    int next;
+    do { next = rtc_seconds(); } while (next == cur);
+    uint64_t t_end = rdtsc();
 
-    uint64_t cps = t2 - t1;
-    if (cps < 1000) cps = 1000000000ULL;  /* implausible -> assume ~1GHz */
-    g_cycles_per_ms = cps / 1000;
-    if (g_cycles_per_ms == 0) g_cycles_per_ms = 1;
+    uint64_t cycles_per_sec = t_end - t_start;
+    if (cycles_per_sec < 1000) cycles_per_sec = 1000000000ULL;  /* nonsense reading, assume ~1GHz */
+    tsc_cycles_per_ms = cycles_per_sec / 1000;
+    if (tsc_cycles_per_ms == 0) tsc_cycles_per_ms = 1;
 
-    g_base_tsc = rdtsc();
-    g_ready    = 1;
+    tsc_base   = rdtsc();
+    calibrated = 1;
 }
 
 uint32_t clock_ms(void)
 {
-    if (!g_ready) return 0;
-    uint64_t d = rdtsc() - g_base_tsc;
-    return (uint32_t)(d / g_cycles_per_ms);
+    if (!calibrated) return 0;
+    uint64_t elapsed = rdtsc() - tsc_base;
+    return (uint32_t)(elapsed / tsc_cycles_per_ms);
 }
 
 void clock_delay_ms(uint32_t ms)

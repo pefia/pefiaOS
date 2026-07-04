@@ -1,11 +1,21 @@
-/* kernel/js.c - a bounded tree-walking JavaScript subset over the DOM. */
+/* kernel/js.c
+ *
+ * Bounded tree-walking JS-subset interpreter over the DOM. No libc, so the
+ * usual string zoo (strlen/strcmp/tolower) gets reinvented below in miniature.
+ *
+ * Strings never move once made: everything the interpreter produces (literals,
+ * concatenation results, attribute reads, whatever) gets appended into one big
+ * arena and referred to afterwards by its byte offset rather than a pointer.
+ * That's what lets Value stay a flat, copyable struct with an `int soff`
+ * instead of carrying real char* and having to worry about who owns it or
+ * when it gets freed - nothing is ever freed until the next script starts and
+ * the whole arena resets. The tradeoff is JS_STR_CAP: run something that
+ * concatenates megabytes of text and str_intern starts returning 0 (the ""
+ * sentinel) instead of growing.
+ */
 #include "js.h"
 #include "domrt.h"
 #include "domparse.h"
-
-/* ========================================================================== */
-/* string arena + tiny libc                                                   */
-/* ========================================================================== */
 
 #define JS_STR_CAP   (192 * 1024)
 static char g_str[JS_STR_CAP];
@@ -19,7 +29,7 @@ static char j_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 static int str_intern(const char *s, int len)
 {
     if (len < 0) len = j_slen(s);
-    if (g_strlen + len + 1 > JS_STR_CAP) return 0;   /* offset 0 == "" sentinel */
+    if (g_strlen + len + 1 > JS_STR_CAP) return 0;   /* arena full: fall back to "" */
     int off = g_strlen;
     for (int i = 0; i < len; i++) g_str[off + i] = s[i];
     g_str[off + len] = 0;
@@ -63,23 +73,26 @@ static int parse_int_str(const char *s)
     return sign * v;
 }
 
-/* ========================================================================== */
-/* error / budget state                                                       */
-/* ========================================================================== */
-
+/* g_err latches on the first problem (syntax we don't handle, a blown limit,
+ * whatever) and every later stage checks it and bails immediately - cheaper
+ * than threading a return code through the whole parser/evaluator, and it
+ * means a broken script just quietly does nothing instead of taking the
+ * kernel down with it. STEP_MAX exists so `while(true){}` in a page's script
+ * can't wedge the browser; DEPTH_MAX does the same job for recursion (both
+ * eval() and exec() count against it, since a pathological script can nest
+ * either one). g_dirty just tracks whether js_run should tell the caller to
+ * re-layout the page. */
 static int g_err;
 static long g_steps;
 #define STEP_MAX  6000000L
 #define DEPTH_MAX 80
 static int g_depth;
-static int g_dirty;          /* DOM mutated since js_run started */
+static int g_dirty;
 
 static void fail(void) { g_err = 1; }
 static int  budget(void) { if (++g_steps > STEP_MAX) g_err = 1; return g_err; }
 
-/* ========================================================================== */
-/* tokenizer                                                                  */
-/* ========================================================================== */
+/* --- tokenizer ------------------------------------------------------------ */
 
 enum { T_EOF, T_NUM, T_STR, T_IDENT, T_PUNCT };
 typedef struct { int type; int num; int soff; char op[4]; } Tok;
@@ -113,13 +126,11 @@ static void tokenize(const char *s, int n)
     while (i < n && !g_err) {
         char c = s[i];
         if (is_ws(c)) { i++; continue; }
-        /* comments */
         if (c == '/' && i + 1 < n && s[i+1] == '/') { i += 2; while (i < n && s[i] != '\n') i++; continue; }
         if (c == '/' && i + 1 < n && s[i+1] == '*') { i += 2; while (i + 1 < n && !(s[i]=='*'&&s[i+1]=='/')) i++; i += 2; continue; }
 
         if (g_ntoks >= MAX_TOKS) { fail(); break; }
 
-        /* number */
         if ((c >= '0' && c <= '9') || (c == '.' && i+1 < n && s[i+1] >= '0' && s[i+1] <= '9')) {
             int j = i, val = 0, ishex = 0;
             if (c == '0' && i+1 < n && (s[i+1]=='x'||s[i+1]=='X')) {
@@ -134,14 +145,16 @@ static void tokenize(const char *s, int n)
                 }
             } else {
                 while (j < n && s[j] >= '0' && s[j] <= '9') { val = val*10 + (s[j]-'0'); j++; }
-                if (j < n && s[j] == '.') { j++; while (j < n && s[j] >= '0' && s[j] <= '9') j++; } /* truncate frac */
+                /* numbers are ints here, so "3.14" scans the fraction and drops it */
+                if (j < n && s[j] == '.') { j++; while (j < n && s[j] >= '0' && s[j] <= '9') j++; }
                 if (j < n && (s[j]=='e'||s[j]=='E')) { j++; if (j<n&&(s[j]=='+'||s[j]=='-'))j++; while (j<n&&s[j]>='0'&&s[j]<='9')j++; }
             }
             (void)ishex;
             Tok *t = &g_toks[g_ntoks++]; t->type = T_NUM; t->num = val;
             i = j; continue;
         }
-        /* string (' " `) */
+        /* strings: single, double, and backtick all treated the same - no
+         * template-literal interpolation, `${x}` just ends up as literal text */
         if (c == '"' || c == '\'' || c == '`') {
             char q = c; i++;
             char buf[2048]; int bl = 0;
@@ -156,12 +169,13 @@ static void tokenize(const char *s, int n)
                 if (bl < 2047) buf[bl++] = ch;
                 i++;
             }
-            if (i < n) i++; /* closing quote */
+            if (i < n) i++; /* eat closing quote */
             buf[bl] = 0;
             Tok *t = &g_toks[g_ntoks++]; t->type = T_STR; t->soff = str_intern(buf, bl);
             continue;
         }
-        /* identifier / keyword */
+        /* identifiers and keywords share a token type; the parser figures out
+         * which keyword it's looking at by comparing the interned text */
         if (is_id_start(c)) {
             int j = i; while (j < n && is_id_part(s[j])) j++;
             char buf[128]; int bl = 0;
@@ -170,7 +184,8 @@ static void tokenize(const char *s, int n)
             Tok *t = &g_toks[g_ntoks++]; t->type = T_IDENT; t->soff = str_intern(buf, bl);
             i = j; continue;
         }
-        /* punctuator */
+        /* punctuator: try the multi-char table first so "===" doesn't get
+         * split into "==" + "=" */
         {
             int matched = 0;
             for (int m = 0; MULTI[m]; m++) {
@@ -187,9 +202,7 @@ static void tokenize(const char *s, int n)
     if (g_ntoks < MAX_TOKS) { g_toks[g_ntoks].type = T_EOF; }
 }
 
-/* ========================================================================== */
-/* AST                                                                        */
-/* ========================================================================== */
+/* --- AST ------------------------------------------------------------------- */
 
 enum {
     A_NUM, A_STR, A_BOOL, A_NULL, A_UNDEF, A_IDENT,
@@ -208,11 +221,18 @@ enum {
     OP_PREINC, OP_PREDEC, OP_POSTINC, OP_POSTDEC
 };
 
+/* One node shape for every kind of statement/expression - a,b,c,d mean
+ * different things depending on n->kind (e.g. a/b/c are cond/then/else for
+ * A_IF but init/cond/update... plus d for A_FOR). Wasteful of a few bytes per
+ * node, but it means the parser doesn't need a different struct per
+ * production, and nodes come out of a flat array (g_ast) instead of malloc so
+ * there's nothing to free. list/next chain siblings for anything with a
+ * variable number of children: block statements, call args, function params. */
 typedef struct AstNode {
     int kind, op, ival, soff;
     struct AstNode *a, *b, *c, *d;
-    struct AstNode *list;   /* head of a child list */
-    struct AstNode *next;   /* next sibling within a list */
+    struct AstNode *list;
+    struct AstNode *next;
 } AstNode;
 
 #define MAX_AST 30000
@@ -228,9 +248,22 @@ static AstNode *node(int kind)
     return n;
 }
 
-/* ========================================================================== */
-/* parser                                                                     */
-/* ========================================================================== */
+/* appends `item` to the list hanging off container->list, tracked via an
+ * external tail pointer so we don't have to walk the list to find the end
+ * every time - this exact dance repeats in every place that builds a sibling
+ * chain (block bodies, var decls, call args, top-level program) */
+static void list_append(AstNode *container, AstNode **tail, AstNode *item)
+{
+    if (!container || !item) return;
+    if (!container->list) container->list = item;
+    else (*tail)->next = item;
+    *tail = item;
+}
+
+/* --- parser ----------------------------------------------------------------
+ * Recursive descent, with parse_bin doing precedence climbing for the binary
+ * operators (see bin_op's table below) rather than a wall of parse_addsub /
+ * parse_muldiv / ... functions. */
 
 static int g_pos;
 
@@ -260,18 +293,17 @@ static AstNode *parse_primary(void)
             advance();
             AstNode *fn = node(A_FUNC);
             if (cur()->type == T_IDENT) { if (fn) fn->soff = cur()->soff; advance(); }
-            /* params */
             if (!eat_punct("(")) { fail(); return fn; }
             AstNode *ptail = 0;
             while (!is_punct(")") && cur()->type != T_EOF && !g_err) {
                 if (cur()->type == T_IDENT) {
                     AstNode *p = node(A_IDENT); if (p) p->soff = cur()->soff; advance();
-                    if (fn) { if (!fn->list) fn->list = p; else ptail->next = p; ptail = p; }
+                    list_append(fn, &ptail, p);
                 } else advance();
                 if (!eat_punct(",")) break;
             }
             eat_punct(")");
-            fn->a = parse_stmt();    /* body (a block) */
+            fn->a = parse_stmt();    /* body block */
             return fn;
         }
         advance();
@@ -283,7 +315,8 @@ static AstNode *parse_primary(void)
         eat_punct(")");
         return e;
     }
-    /* unsupported (array/object literal/regex/template-with-interp): abort */
+    /* whatever's left is stuff we don't parse - array/object literals, regex,
+     * template interpolation. Bail rather than pretend to understand it. */
     fail();
     return 0;
 }
@@ -296,7 +329,7 @@ static AstNode *parse_args_call(AstNode *callee)
     advance(); /* past ( */
     while (!is_punct(")") && cur()->type != T_EOF && !g_err) {
         AstNode *arg = parse_assign();
-        if (call && arg) { if (!call->list) call->list = arg; else tail->next = arg; tail = arg; }
+        list_append(call, &tail, arg);
         if (!eat_punct(",")) break;
     }
     eat_punct(")");
@@ -347,7 +380,9 @@ static AstNode *parse_unary(void)
     return parse_postfix();
 }
 
-/* precedence climbing for binary operators */
+/* table of binary operators the tokenizer might hand us next, with their
+ * precedence (higher binds tighter); &&/|| are flagged as logical since they
+ * need to short-circuit instead of eagerly evaluating both sides */
 static int bin_op(int *prec, int *logical)
 {
     *logical = 0;
@@ -431,7 +466,7 @@ static AstNode *parse_assign(void)
 static AstNode *parse_expr(void)
 {
     AstNode *e = parse_assign();
-    while (is_punct(",") && !g_err) { advance(); e = parse_assign(); }  /* comma: last value */
+    while (is_punct(",") && !g_err) { advance(); e = parse_assign(); }  /* comma op: keep the last one */
     return e;
 }
 
@@ -442,25 +477,26 @@ static AstNode *parse_block(void)
     advance(); /* past { */
     while (!is_punct("}") && cur()->type != T_EOF && !g_err) {
         AstNode *s = parse_stmt();
-        if (blk && s) { if (!blk->list) blk->list = s; else tail->next = s; tail = s; }
+        list_append(blk, &tail, s);
     }
     eat_punct("}");
     return blk;
 }
 
+/* "var a = 1, b, c = 2;" becomes an A_BLOCK of A_VARDECL nodes rather than
+ * its own AST shape - one less node kind to handle everywhere else */
 static AstNode *parse_var(void)
 {
-    /* var a = expr, b = expr ; -> a BLOCK of A_VARDECL */
-    advance(); /* var/let/const */
+    advance(); /* var/let/const - we don't distinguish them */
     AstNode *blk = node(A_BLOCK);
     AstNode *tail = 0;
     while (!g_err) {
         if (cur()->type != T_IDENT) { fail(); break; }
-        AstNode *d = node(A_VARDECL);
-        if (d) d->soff = cur()->soff;
+        AstNode *decl = node(A_VARDECL);
+        if (decl) decl->soff = cur()->soff;
         advance();
-        if (eat_punct("=")) { if (d) d->a = parse_assign(); }
-        if (blk && d) { if (!blk->list) blk->list = d; else tail->next = d; tail = d; }
+        if (eat_punct("=")) { if (decl) decl->a = parse_assign(); }
+        list_append(blk, &tail, decl);
         if (!eat_punct(",")) break;
     }
     eat_punct(";");
@@ -473,10 +509,7 @@ static AstNode *parse_stmt(void)
     if (is_punct("{")) return parse_block();
     if (is_punct(";")) { advance(); return node(A_EMPTY); }
     if (is_kw("var") || is_kw("let") || is_kw("const")) return parse_var();
-    if (is_kw("function")) {
-        AstNode *fn = parse_primary();   /* function decl parsed as primary */
-        return fn;
-    }
+    if (is_kw("function")) return parse_primary();  /* decl and expr share the same parse */
     if (is_kw("if")) {
         advance();
         AstNode *n = node(A_IF);
@@ -500,15 +533,14 @@ static AstNode *parse_stmt(void)
         advance();
         AstNode *n = node(A_FOR);
         eat_punct("(");
-        /* init */
+        /* only the classic three-clause for(;;) is supported - no for-in or
+         * for-of. Not worth the object-iteration machinery for a subset that
+         * has no real objects/arrays to iterate over anyway. */
         if (is_punct(";")) { advance(); }
         else if (is_kw("var") || is_kw("let") || is_kw("const")) { if (n) n->a = parse_var(); }
         else { AstNode *e = parse_expr(); AstNode *es = node(A_EXPRSTMT); if (es) es->a = e; if (n) n->a = es; eat_punct(";"); }
-        /* for-in / for-of unsupported: detect and abort */
-        /* cond */
         if (!is_punct(";")) { if (n) n->b = parse_expr(); }
         eat_punct(";");
-        /* update */
         if (!is_punct(")")) { if (n) n->c = parse_expr(); }
         eat_punct(")");
         if (n) n->d = parse_stmt();
@@ -523,7 +555,7 @@ static AstNode *parse_stmt(void)
     }
     if (is_kw("break")) { advance(); eat_punct(";"); return node(A_BREAK); }
     if (is_kw("continue")) { advance(); eat_punct(";"); return node(A_CONTINUE); }
-    /* expression statement */
+    /* fell through everything above - must be a bare expression statement */
     {
         AstNode *e = parse_expr();
         AstNode *s = node(A_EXPRSTMT);
@@ -533,9 +565,13 @@ static AstNode *parse_stmt(void)
     }
 }
 
-/* ========================================================================== */
-/* values                                                                     */
-/* ========================================================================== */
+/* --- values -----------------------------------------------------------------
+ * Value is a tagged union in struct clothing (no real unions here, just every
+ * field laid out side by side) - `type` says which of num/soff/objkind/node/fn
+ * actually means anything. O_* distinguishes the flavors of V_OBJ: DOM
+ * elements, the style/console/window/Math singletons, user functions, and
+ * builtins. B_* is which builtin, for the handful that don't need their own
+ * O_ kind. */
 
 enum { V_UNDEF, V_NULL, V_NUM, V_BOOL, V_STR, V_OBJ };
 enum { O_DOCUMENT, O_ELEMENT, O_STYLE, O_CONSOLE, O_WINDOW, O_MATH,

@@ -1,15 +1,12 @@
 /* kernel/puredoom.c
- * -----------------------------------------------------------------------------
- * The single translation unit that compiles id Software's DOOM, by way of
- * Daivuk's PureDOOM (a zero-dependency, single-header port). We define
- * DOOM_IMPLEMENTATION here and *nowhere else*; the rest of the kernel includes
- * PureDOOM.h without it, getting only the public API.
+ * The one translation unit where PureDOOM actually gets compiled. Everywhere
+ * else includes PureDOOM.h without DOOM_IMPLEMENTATION and only sees the
+ * public API - define it twice and you get duplicate symbols across the link.
  *
- * We deliberately do NOT define any DOOM_IMPLEMENT_* macros: those would pull in
- * the host stdio/stdlib/sys-time default callbacks. Instead the whole platform
- * layer (malloc, file I/O over the embedded WAD, time, print) is supplied at
- * runtime from doom_app.c via doom_set_*.
- * -----------------------------------------------------------------------------
+ * None of the DOOM_IMPLEMENT_* host callbacks are defined here on purpose:
+ * those default implementations assume a hosted stdio/stdlib/clock, which we
+ * don't have. doom_app.c wires up doom_set_* instead, routing malloc/file
+ * I/O/time/print through our own kmalloc, the embedded WAD, and clock_ms.
  */
 #define DOOM_IMPLEMENTATION
 #include "PureDOOM.h"

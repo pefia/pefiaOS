@@ -1,9 +1,6 @@
-/* kernel/console.h
- * -----------------------------------------------------------------------------
- * A scrolling text console rendered onto a rectangular region of the
- * framebuffer using the embedded 8x16 bitmap font.
- * -----------------------------------------------------------------------------
- */
+/* Scrolling text console drawn onto a rectangle of the framebuffer using
+ * the embedded 8x16 bitmap font. Think "a terminal", minus the terminal -
+ * just character cells and a cursor. */
 #ifndef PEFIA_CONSOLE_H
 #define PEFIA_CONSOLE_H
 

@@ -1,21 +1,12 @@
 /* kernel/games.h
- * -----------------------------------------------------------------------------
- * Seven built-in games, all driven through one uniform app interface so the
- * window manager only needs a single WIN_GAME branch:
+ * One dispatch table, seven games - Flappy Bird, Pong, a Mario-style platformer,
+ * a Wolfenstein-style raycaster maze, Tetris, Snake, and Breakout - so the
+ * window manager only needs a single WIN_GAME case instead of one per game.
  *
- *   GAME_FLAPPY   - Flappy Bird   (tap to flap)
- *   GAME_PONG     - Pong          (you vs. the CPU)
- *   GAME_MARIO    - a Mario-style platform level (run, jump, stomp, flag)
- *   GAME_RAYCAST  - Maze 3D, a Wolfenstein-style raycaster (real 3D rendering)
- *   GAME_TETRIS   - Tetris        (the seven tetrominoes, line clears)
- *   GAME_SNAKE    - Snake         (grid snake; eat apples, don't eat yourself)
- *   GAME_BREAKOUT - Breakout      (paddle + ball vs. a wall of bricks)
- *
- * Each game composes its frame into an off-screen buffer and presents it with
- * fb_blit() for flicker-free animation. Controls use the real-time key-state
- * API in input.h (WASD or arrow keys; space = flap/jump/hard-drop/restart).
- * -----------------------------------------------------------------------------
- */
+ * Every game renders into an off-screen buffer and hands it to fb_blit() in
+ * one shot, which is what keeps them flicker-free. Input is read straight from
+ * input.h's key-state table (WASD or arrows; space covers flap/jump/hard-drop
+ * and also restarts after a game over). */
 #ifndef PEFIA_GAMES_H
 #define PEFIA_GAMES_H
 

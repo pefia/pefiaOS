@@ -1,4 +1,4 @@
-/* kernel/taskbar.h - bottom bar with Start menu, search, window buttons, clock. */
+/* kernel/taskbar.h - the bottom bar: Start menu + search, window buttons, clock. */
 #ifndef PEFIA_TASKBAR_H
 #define PEFIA_TASKBAR_H
 

@@ -1,12 +1,11 @@
 /* kernel/wm.c
- * -----------------------------------------------------------------------------
- * Window manager + compositor. Windows live in z-order in wins[] (last = top).
- * Each repaint: gradient desktop, every window back-to-front (with a drop
- * shadow), then the taskbar on top. Input is polled non-blocking: the taskbar
- * gets first crack at clicks and at keys while its menu is open; otherwise
- * keys go to the focused (top) window's app, and clicks raise / drag / close /
- * or pass into the app body.
- * -----------------------------------------------------------------------------
+ * Window manager + compositor. Windows live in z-order inside wins[], with
+ * the last entry always on top. Each frame: paint the desktop gradient,
+ * every window back-to-front with a drop shadow, then the taskbar over all
+ * of it. Input is polled, never blocking - the taskbar gets first look at
+ * clicks (and at keys while its menu is open), otherwise keys go to whatever
+ * window is on top and clicks raise/drag/resize/close or fall through to the
+ * app underneath.
  */
 #include "wm.h"
 #include "framebuffer.h"
@@ -24,20 +23,21 @@
 
 #include <stddef.h>
 
-#define MAXW     16
-#define TITLEH   26
-#define CLOSE_SZ 16
-#define GLYPH_W  8
-#define GLYPH_H  16
-#define PAD      10
-#define GRIP     16      /* bottom-right resize handle */
-#define MIN_W    200     /* smallest a window may be dragged to */
-#define MIN_H    150
+#define MAX_WINDOWS 16
+#define TITLE_H     26
+#define CLOSE_SZ    16
+#define GLYPH_W     8
+#define GLYPH_H     16
+#define PAD         10
+#define GRIP        16    /* bottom-right resize handle, in pixels */
+#define MIN_W       200   /* a window can't be resized smaller than this */
+#define MIN_H       150
 
-static Window *wins[MAXW];
-static int nwins;
+static Window *wins[MAX_WINDOWS];
+static int win_count;
 
-static color_t c_border, c_title, c_titledim, c_titletext, c_content, c_text, c_close, c_shadow;
+static color_t col_border, col_title, col_title_dim, col_title_text;
+static color_t col_content, col_text, col_close, col_shadow;
 
 static void copy_str(char *dst, const char *src, int cap)
 {
@@ -48,20 +48,20 @@ static void copy_str(char *dst, const char *src, int cap)
 
 void wm_init(void)
 {
-    nwins = 0;
-    c_border    = fb_rgb(56, 86, 142);
-    c_title     = fb_rgb(34, 92, 196);
-    c_titledim  = fb_rgb(84, 98, 128);
-    c_titletext = fb_rgb(245, 249, 255);
-    c_content   = fb_rgb(246, 249, 255);
-    c_text      = fb_rgb(27, 35, 52);
-    c_close     = fb_rgb(214, 76, 96);
-    c_shadow    = fb_rgb(16, 23, 37);
+    win_count = 0;
+    col_border     = fb_rgb(56, 86, 142);
+    col_title      = fb_rgb(34, 92, 196);
+    col_title_dim  = fb_rgb(84, 98, 128);
+    col_title_text = fb_rgb(245, 249, 255);
+    col_content    = fb_rgb(246, 249, 255);
+    col_text       = fb_rgb(27, 35, 52);
+    col_close      = fb_rgb(214, 76, 96);
+    col_shadow     = fb_rgb(16, 23, 37);
 }
 
 static Window *alloc_window(int x, int y, int w, int h, const char *title)
 {
-    if (nwins >= MAXW) return NULL;
+    if (win_count >= MAX_WINDOWS) return NULL;
     Window *win = (Window *)kmalloc(sizeof(Window));
     if (!win) return NULL;
     win->x = x; win->y = y; win->w = w; win->h = h;
@@ -70,7 +70,7 @@ static Window *alloc_window(int x, int y, int w, int h, const char *title)
     win->state = NULL;
     win->body[0] = '\0';
     copy_str(win->title, title, (int)sizeof(win->title));
-    wins[nwins++] = win;
+    wins[win_count++] = win;
     return win;
 }
 
@@ -88,7 +88,8 @@ Window *wm_create_explorer(int x, int y, int w, int h, const char *title, int di
     Window *win = alloc_window(x, y, w, h, title);
     if (!win) return NULL;
     win->kind = WIN_EXPLORER;
-    win->cwd = dir; win->sel = -1;
+    win->cwd = dir;
+    win->sel = -1;
     return win;
 }
 
@@ -137,107 +138,112 @@ Window *wm_create_doom(int x, int y, int w, int h)
     return win;
 }
 
-static void draw_clipped(int x, int y, const char *s, int maxcols, color_t fg, color_t bg)
+static void draw_text_clipped(int x, int y, const char *s, int max_cols, color_t fg, color_t bg)
 {
-    char buf[128];
-    if (maxcols <= 0) return;
-    if (maxcols > 127) maxcols = 127;
+    char clipped[128];
+    if (max_cols <= 0) return;
+    if (max_cols > 127) max_cols = 127;
     int i = 0;
-    while (s[i] && i < maxcols) { buf[i] = s[i]; i++; }
-    buf[i] = '\0';
-    gfx_text(x, y, buf, fg, bg);
+    while (s[i] && i < max_cols) { clipped[i] = s[i]; i++; }
+    clipped[i] = '\0';
+    gfx_text(x, y, clipped, fg, bg);
 }
 
-static void draw_body(Window *w)
+/* Word-wraps win->body (used by WIN_INFO) into the content area, breaking at
+ * the last space before a line would overflow rather than mid-word. */
+static void draw_info_body(Window *w)
 {
-    int maxcols = (w->w - 2 * PAD) / GLYPH_W;
-    int maxrows = (w->h - TITLEH - PAD - 4) / GLYPH_H;
-    if (maxcols <= 0 || maxrows <= 0) return;
-    if (maxcols > 127) maxcols = 127;
+    int max_cols = (w->w - 2 * PAD) / GLYPH_W;
+    int max_rows = (w->h - TITLE_H - PAD - 4) / GLYPH_H;
+    if (max_cols <= 0 || max_rows <= 0) return;
+    if (max_cols > 127) max_cols = 127;
 
     const char *s = w->body;
-    int baseY = w->y + TITLEH + 8;
+    int base_y = w->y + TITLE_H + 8;
     char line[128];
 
-    for (int row = 0; row < maxrows && *s; row++) {
+    for (int row = 0; row < max_rows && *s; row++) {
         while (*s == ' ') s++;
         if (!*s) break;
-        int len = 0, taken = 0, lastSpace = -1;
+
+        int len = 0, consumed = 0, last_space = -1;
         const char *scan = s;
-        while (*scan && len < maxcols) {
-            if (*scan == ' ') lastSpace = len;
+        while (*scan && len < max_cols) {
+            if (*scan == ' ') last_space = len;
             line[len++] = *scan++;
-            taken++;
+            consumed++;
         }
-        if (*scan && *scan != ' ' && lastSpace > 0) { len = lastSpace; taken = lastSpace; }
+        if (*scan && *scan != ' ' && last_space > 0) { len = last_space; consumed = last_space; }
         line[len] = '\0';
-        gfx_text(w->x + PAD, baseY + row * GLYPH_H, line, c_text, c_content);
-        s += taken;
+        gfx_text(w->x + PAD, base_y + row * GLYPH_H, line, col_text, col_content);
+        s += consumed;
     }
 }
 
 static void draw_window(Window *w, int focused)
 {
-    fb_fill_rect(w->x + 6, w->y + 6, w->w + 8, w->h + 8, c_shadow);
+    fb_fill_rect(w->x + 6, w->y + 6, w->w + 8, w->h + 8, col_shadow);
     fb_fill_rect(w->x + 3, w->y + 3, w->w + 4, w->h + 4, fb_rgb(35, 46, 66));
 
-    color_t tb = focused ? c_title : c_titledim;
-    color_t tb2 = focused ? fb_rgb(53, 118, 228) : fb_rgb(102, 114, 144);
+    color_t title_bg  = focused ? col_title : col_title_dim;
+    color_t title_top = focused ? fb_rgb(53, 118, 228) : fb_rgb(102, 114, 144);
 
-    fb_fill_rect(w->x - 1, w->y - 1, w->w + 2, w->h + 2, c_border);
-    fb_fill_rect(w->x, w->y, w->w, TITLEH / 2, tb2);
-    fb_fill_rect(w->x, w->y + TITLEH / 2, w->w, TITLEH - (TITLEH / 2), tb);
+    fb_fill_rect(w->x - 1, w->y - 1, w->w + 2, w->h + 2, col_border);
+    fb_fill_rect(w->x, w->y, w->w, TITLE_H / 2, title_top);
+    fb_fill_rect(w->x, w->y + TITLE_H / 2, w->w, TITLE_H - (TITLE_H / 2), title_bg);
 
     int title_cols = (w->w - 8 - CLOSE_SZ - 20) / GLYPH_W;
-    draw_clipped(w->x + 10, w->y + 6, w->title, title_cols, c_titletext, tb);
+    draw_text_clipped(w->x + 10, w->y + 6, w->title, title_cols, col_title_text, title_bg);
 
-    int bx = w->x + w->w - CLOSE_SZ - 6, by = w->y + 5;
-    fb_fill_rect(bx, by, CLOSE_SZ, CLOSE_SZ, c_close);
-    fb_fill_rect(bx, by + CLOSE_SZ - 1, CLOSE_SZ, 1, fb_rgb(160, 45, 65));
-    gfx_text(bx + 4, by + 1, "x", c_titletext, c_close);
+    int close_x = w->x + w->w - CLOSE_SZ - 6, close_y = w->y + 5;
+    fb_fill_rect(close_x, close_y, CLOSE_SZ, CLOSE_SZ, col_close);
+    fb_fill_rect(close_x, close_y + CLOSE_SZ - 1, CLOSE_SZ, 1, fb_rgb(160, 45, 65));
+    gfx_text(close_x + 4, close_y + 1, "x", col_title_text, col_close);
 
-    int cy = w->y + TITLEH, cw = w->w, chh = w->h - TITLEH;
-    if      (w->kind == WIN_EXPLORER) explorer_paint(w, w->x, cy, cw, chh);
-    else if (w->kind == WIN_TERMINAL) terminal_paint(w, w->x, cy, cw, chh);
-    else if (w->kind == WIN_NOTEPAD)  notepad_paint(w, w->x, cy, cw, chh);
-    else if (w->kind == WIN_BROWSER)  browser_paint(w, w->x, cy, cw, chh);
-    else if (w->kind == WIN_GAME)     game_paint(w, w->x, cy, cw, chh);
-    else if (w->kind == WIN_DOOM)     doom_app_paint(w, w->x, cy, cw, chh);
-    else {
-        fb_fill_rect(w->x, cy, cw, chh, c_content);
-        draw_body(w);
+    int body_y = w->y + TITLE_H, body_w = w->w, body_h = w->h - TITLE_H;
+    switch (w->kind) {
+    case WIN_EXPLORER: explorer_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_TERMINAL: terminal_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_NOTEPAD:  notepad_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_BROWSER:  browser_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_GAME:     game_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_DOOM:     doom_app_paint(w, w->x, body_y, body_w, body_h); break;
+    default:
+        fb_fill_rect(w->x, body_y, body_w, body_h, col_content);
+        draw_info_body(w);
+        break;
     }
 
     /* resize grip: three diagonal ticks in the bottom-right corner */
-    int gxp = w->x + w->w, gyp = w->y + w->h;
+    int grip_x = w->x + w->w, grip_y = w->y + w->h;
     for (int d = 4; d <= 12; d += 4)
         for (int k = 0; k < d; k += 3)
-            fb_fill_rect(gxp - 3 - k, gyp - 3 - (d - k), 2, 2, c_border);
+            fb_fill_rect(grip_x - 3 - k, grip_y - 3 - (d - k), 2, 2, col_border);
 }
 
 static void draw_desktop(void)
 {
-    int W = fb_width(), H = fb_height();
-    int bands = 64, bh = (H + bands - 1) / bands;
+    int w = fb_width(), h = fb_height();
+    int bands = 64, band_h = (h + bands - 1) / bands;
     for (int i = 0; i < bands; i++) {
         int t = (i * 255) / bands;
         uint8_t r = (uint8_t)(10 + (t * 16) / 255);
         uint8_t g = (uint8_t)(26 + (t * 58) / 255);
         uint8_t b = (uint8_t)(54 + (t * 130) / 255);
-        fb_fill_rect(0, i * bh, W, bh, fb_rgb(r, g, b));
+        fb_fill_rect(0, i * band_h, w, band_h, fb_rgb(r, g, b));
     }
 
-    fb_fill_rect(0, H - 140, W, 140, fb_rgb(18, 58, 132));
-    fb_fill_rect(0, H - 139, W, 1, fb_rgb(74, 126, 218));
+    fb_fill_rect(0, h - 140, w, 140, fb_rgb(18, 58, 132));
+    fb_fill_rect(0, h - 139, w, 1, fb_rgb(74, 126, 218));
 }
 
 static void wm_paint(void)
 {
     mouse_hide();
     draw_desktop();
-    for (int i = 0; i < nwins; i++)
+    for (int i = 0; i < win_count; i++)
         if (wins[i]->visible)
-            draw_window(wins[i], i == nwins - 1);
+            draw_window(wins[i], i == win_count - 1);
     taskbar_paint();
     mouse_show();
 }
@@ -245,70 +251,80 @@ static void wm_paint(void)
 static void raise_to_top(int i)
 {
     Window *w = wins[i];
-    for (int k = i; k < nwins - 1; k++) wins[k] = wins[k + 1];
-    wins[nwins - 1] = w;
+    for (int k = i; k < win_count - 1; k++) wins[k] = wins[k + 1];
+    wins[win_count - 1] = w;
 }
 
 static void close_index(int i)
 {
-    if (wins[i]->kind == WIN_GAME)      game_free(wins[i]->state);   /* frees its buffer too */
-    else if (wins[i]->kind == WIN_DOOM) doom_app_free(wins[i]->state);
-    else if (wins[i]->state)            kfree(wins[i]->state);
+    switch (wins[i]->kind) {
+    case WIN_GAME: game_free(wins[i]->state); break;      /* also frees its offscreen buffer */
+    case WIN_DOOM: doom_app_free(wins[i]->state); break;
+    default:
+        if (wins[i]->state) kfree(wins[i]->state);
+        break;
+    }
     kfree(wins[i]);
-    for (int k = i; k < nwins - 1; k++) wins[k] = wins[k + 1];
-    nwins--;
+    for (int k = i; k < win_count - 1; k++) wins[k] = wins[k + 1];
+    win_count--;
 }
 
-static int inside(Window *w, int px, int py)
+static int point_in_window(Window *w, int px, int py)
 {
     return px >= w->x - 1 && px < w->x + w->w + 1 &&
            py >= w->y - 1 && py < w->y + w->h + 1;
 }
 
-int         wm_count(void)  { return nwins; }
-const char *wm_title(int i) { return (i >= 0 && i < nwins) ? wins[i]->title : ""; }
-void        wm_raise(int i) { if (i >= 0 && i < nwins) raise_to_top(i); }
+int         wm_count(void)  { return win_count; }
+const char *wm_title(int i) { return (i >= 0 && i < win_count) ? wins[i]->title : ""; }
+void        wm_raise(int i) { if (i >= 0 && i < win_count) raise_to_top(i); }
 
 void wm_run(void)
 {
     int dragging = 0, resizing = 0, drag_dx = 0, drag_dy = 0;
-    unsigned prev_btns = mouse_buttons();
+    unsigned prev_buttons = mouse_buttons();
     int prev_mx = mouse_x(), prev_my = mouse_y();
 
     wm_paint();
 
     for (;;) {
-        for (int i = 0; i < nwins; i++) {
-            if (wins[i] && wins[i]->visible && wins[i]->kind == WIN_BROWSER) {
+        for (int i = 0; i < win_count; i++) {
+            if (wins[i] && wins[i]->visible && wins[i]->kind == WIN_BROWSER)
                 browser_tick(wins[i]);
-            }
         }
 
-        /* Animate the focused game/DOOM every iteration (they self-pace). */
-        if (nwins > 0 && wins[nwins - 1]->visible) {
-            Window *t = wins[nwins - 1];
-            if (t->kind == WIN_GAME)
-                game_tick(t, t->x, t->y + TITLEH, t->w, t->h - TITLEH);
-            else if (t->kind == WIN_DOOM)
-                doom_app_tick(t, t->x, t->y + TITLEH, t->w, t->h - TITLEH);
+        /* Only the topmost window gets a tick - games and DOOM pace their own
+         * animation, and there's no point advancing a game hidden behind
+         * something else. */
+        if (win_count > 0 && wins[win_count - 1]->visible) {
+            Window *top = wins[win_count - 1];
+            if (top->kind == WIN_GAME)
+                game_tick(top, top->x, top->y + TITLE_H, top->w, top->h - TITLE_H);
+            else if (top->kind == WIN_DOOM)
+                doom_app_tick(top, top->x, top->y + TITLE_H, top->w, top->h - TITLE_H);
         }
 
         int key = input_poll();
 
-        unsigned b = mouse_buttons();
+        unsigned buttons = mouse_buttons();
         int mx = mouse_x(), my = mouse_y();
         int moved     = (mx != prev_mx || my != prev_my);
-        int left_down = (b & 1) && !(prev_btns & 1);
-        int left_up   = !(b & 1) && (prev_btns & 1);
+        int left_down = (buttons & 1) && !(prev_buttons & 1);
+        int left_up   = !(buttons & 1) && (prev_buttons & 1);
 
         if (key) {
-            if (taskbar_menu_open()) { taskbar_key((char)key); wm_paint(); }
-            else if (nwins > 0) {
-                Window *f = wins[nwins - 1];
-                if (f->kind == WIN_TERMINAL) { terminal_key(f, (char)key); wm_paint(); }
-                else if (f->kind == WIN_NOTEPAD) { notepad_key(f, (char)key); wm_paint(); }
-                else if (f->kind == WIN_BROWSER) { browser_key(f, (char)key); wm_paint(); }
-                else if (f->kind == WIN_GAME) { game_key(f, (char)key); /* next tick repaints */ }
+            if (taskbar_menu_open()) {
+                taskbar_key((char)key);
+                wm_paint();
+            } else if (win_count > 0) {
+                Window *focused = wins[win_count - 1];
+                switch (focused->kind) {
+                case WIN_TERMINAL: terminal_key(focused, (char)key); wm_paint(); break;
+                case WIN_NOTEPAD:  notepad_key(focused, (char)key);  wm_paint(); break;
+                case WIN_BROWSER:  browser_key(focused, (char)key);  wm_paint(); break;
+                case WIN_GAME:     game_key(focused, (char)key); break;   /* next tick repaints */
+                default: break;
+                }
             }
         }
 
@@ -316,31 +332,31 @@ void wm_run(void)
             if (taskbar_click(mx, my)) {
                 wm_paint();
             } else {
-                for (int i = nwins - 1; i >= 0; i--) {
+                for (int i = win_count - 1; i >= 0; i--) {
                     Window *w = wins[i];
-                    if (!w->visible || !inside(w, mx, my)) continue;
+                    if (!w->visible || !point_in_window(w, mx, my)) continue;
 
-                    int bx = w->x + w->w - CLOSE_SZ - 5, by = w->y + 5;
-                    int on_close = mx >= bx && mx < bx + CLOSE_SZ &&
-                                   my >= by && my < by + CLOSE_SZ;
-                    int on_title = my >= w->y && my < w->y + TITLEH;
+                    int close_x = w->x + w->w - CLOSE_SZ - 5, close_y = w->y + 5;
+                    int on_close = mx >= close_x && mx < close_x + CLOSE_SZ &&
+                                   my >= close_y && my < close_y + CLOSE_SZ;
+                    int on_title = my >= w->y && my < w->y + TITLE_H;
                     int on_grip  = mx >= w->x + w->w - GRIP && mx < w->x + w->w &&
                                    my >= w->y + w->h - GRIP && my < w->y + w->h;
 
                     raise_to_top(i);
-                    Window *tw = wins[nwins - 1];
+                    Window *top = wins[win_count - 1];
                     if (on_close) {
-                        close_index(nwins - 1);
+                        close_index(win_count - 1);
                     } else if (on_grip) {
                         resizing = 1;
                     } else if (on_title) {
                         dragging = 1;
-                        drag_dx = mx - tw->x;
-                        drag_dy = my - tw->y;
-                    } else if (tw->kind == WIN_EXPLORER) {
-                        explorer_click(tw, mx - tw->x, my - (tw->y + TITLEH));
-                    } else if (tw->kind == WIN_BROWSER) {
-                        browser_click(tw, mx - tw->x, my - (tw->y + TITLEH));
+                        drag_dx = mx - top->x;
+                        drag_dy = my - top->y;
+                    } else if (top->kind == WIN_EXPLORER) {
+                        explorer_click(top, mx - top->x, my - (top->y + TITLE_H));
+                    } else if (top->kind == WIN_BROWSER) {
+                        browser_click(top, mx - top->x, my - (top->y + TITLE_H));
                     }
                     wm_paint();
                     break;
@@ -348,32 +364,32 @@ void wm_run(void)
             }
         }
 
-        if (dragging && (b & 1) && moved) {
-            Window *w = wins[nwins - 1];
+        if (dragging && (buttons & 1) && moved) {
+            Window *w = wins[win_count - 1];
             w->x = mx - drag_dx;
             w->y = my - drag_dy;
             if (w->x < 0) w->x = 0;
             if (w->y < 0) w->y = 0;
             if (w->x > fb_width() - 60)      w->x = fb_width() - 60;
-            if (w->y > fb_height() - TITLEH) w->y = fb_height() - TITLEH;
+            if (w->y > fb_height() - TITLE_H) w->y = fb_height() - TITLE_H;
             wm_paint();
         }
 
-        if (resizing && (b & 1) && moved) {
-            Window *w = wins[nwins - 1];
-            int nw = mx - w->x, nh = my - w->y;
-            if (nw < MIN_W) nw = MIN_W;
-            if (nh < MIN_H) nh = MIN_H;
-            if (w->x + nw > fb_width())  nw = fb_width()  - w->x;
-            if (w->y + nh > fb_height()) nh = fb_height() - w->y;
-            w->w = nw; w->h = nh;
-            if (w->kind == WIN_GAME)      game_resize(w, w->w, w->h - TITLEH);
-            else if (w->kind == WIN_DOOM) doom_app_resize(w, w->w, w->h - TITLEH);
+        if (resizing && (buttons & 1) && moved) {
+            Window *w = wins[win_count - 1];
+            int new_w = mx - w->x, new_h = my - w->y;
+            if (new_w < MIN_W) new_w = MIN_W;
+            if (new_h < MIN_H) new_h = MIN_H;
+            if (w->x + new_w > fb_width())  new_w = fb_width()  - w->x;
+            if (w->y + new_h > fb_height()) new_h = fb_height() - w->y;
+            w->w = new_w; w->h = new_h;
+            if (w->kind == WIN_GAME)      game_resize(w, w->w, w->h - TITLE_H);
+            else if (w->kind == WIN_DOOM) doom_app_resize(w, w->w, w->h - TITLE_H);
             wm_paint();
         }
 
         if (left_up) { dragging = 0; resizing = 0; }
 
-        prev_btns = b; prev_mx = mx; prev_my = my;
+        prev_buttons = buttons; prev_mx = mx; prev_my = my;
     }
 }

@@ -1,59 +1,69 @@
 ; boot/boot.asm
-; -----------------------------------------------------------------------------
-; pefiaOS boot stub (NASM).
 ;
-; GRUB2 enters here in 32-bit protected mode (the Multiboot contract). This
-; version asks GRUB for a LINEAR GRAPHICS framebuffer via the Multiboot v1
-; video fields, then passes the Multiboot magic + info pointer to the C kernel
-; so it can locate the framebuffer.
-; -----------------------------------------------------------------------------
+; Multiboot v1 entry stub. GRUB2 drops us here already in 32-bit protected
+; mode with paging off, so there's no real/protected mode transition to do
+; ourselves - just enough setup to call into C.
+;
+; We ask for a linear framebuffer through the Multiboot video fields (mode 0)
+; instead of relying on VGA text mode, since the desktop needs pixel access.
 
-; ---- Multiboot v1 header flags ----
-MBALIGN  equ 1 << 0              ; align loaded modules on page boundaries
-MEMINFO  equ 1 << 1             ; provide a memory map
-VIDMODE  equ 1 << 2             ; request a video mode (framebuffer)
-MBFLAGS  equ MBALIGN | MEMINFO | VIDMODE
-MAGIC    equ 0x1BADB002          ; magic that lets GRUB find the header
-CHECKSUM equ -(MAGIC + MBFLAGS)  ; magic + flags + checksum must equal 0
+MB_MAGIC    equ 0x1BADB002
+MB_ALIGN    equ 1 << 0
+MB_MEMINFO  equ 1 << 1
+MB_VIDEO    equ 1 << 2
+MB_FLAGS    equ MB_ALIGN | MB_MEMINFO | MB_VIDEO
+MB_CHECKSUM equ -(MB_MAGIC + MB_FLAGS)
+
+FB_MODE     equ 0      ; linear graphics framebuffer (1 would mean text mode)
+FB_WIDTH    equ 1024
+FB_HEIGHT   equ 768
+FB_DEPTH    equ 32
+
+STACK_SIZE  equ 128 * 1024   ; DOOM's renderer + BSP walk recurse deep enough
+                              ; that the old 16 KiB stack wasn't enough headroom
 
 section .multiboot
 align 4
-    dd MAGIC
-    dd MBFLAGS
-    dd CHECKSUM
-    ; Address fields (only used with the a.out kludge, which we don't use as an
-    ; ELF kernel). They must still occupy these 5 dwords so the video fields
-    ; below land at the correct offset (32) that GRUB reads.
-    dd 0, 0, 0, 0, 0
-    ; Video fields: mode_type, width, height, depth.
-    dd 0                         ; 0 = linear graphics framebuffer (1 = text)
-    dd 1024                      ; preferred width  (GRUB picks closest)
-    dd 768                       ; preferred height
-    dd 32                        ; preferred bits per pixel
+    dd MB_MAGIC
+    dd MB_FLAGS
+    dd MB_CHECKSUM
+    ; a.out-kludge header address fields - unused since we're a plain ELF
+    ; kernel, but they still have to occupy these 5 dwords or the video mode
+    ; fields below land at the wrong offset and GRUB won't see them.
+    dd 0
+    dd 0
+    dd 0
+    dd 0
+    dd 0
+    dd FB_MODE
+    dd FB_WIDTH
+    dd FB_HEIGHT
+    dd FB_DEPTH
 
 section .bss
 align 16
-stack_bottom:
-    resb 131072                  ; 128 KiB stack (DOOM's BSP recursion + large
-                                 ; render locals need far more than the original
-                                 ; 16 KiB; everything else is comfortable here)
-stack_top:
+kstack:
+    resb STACK_SIZE
+kstack_top:
 
 section .text
 global _start
-extern kernel_main               ; kernel_main(uint32_t magic, uint32_t info)
+extern kernel_main
 
 _start:
-    mov esp, stack_top
+    mov esp, kstack_top
+    mov ebp, 0          ; zero frame pointer so a stack walker knows to stop here
+    cld                 ; GRUB doesn't guarantee DF=0; our string ops assume forward
 
-    ; GRUB leaves the Multiboot magic in EAX and the info struct pointer in EBX.
-    ; Push them (C cdecl: right-to-left) so kernel_main(eax, ebx) sees them.
-    push ebx                     ; arg 2: multiboot info pointer
-    push eax                     ; arg 1: multiboot magic
-
+    ; GRUB hands us the Multiboot magic in eax and the info struct in ebx.
+    ; cdecl pushes right-to-left, so this calls kernel_main(magic, mb_info).
+    push ebx
+    push eax
     call kernel_main
 
-.hang:
+    ; kernel_main is not supposed to return, but if it ever does, stop cleanly
+    ; instead of running off into whatever memory follows.
+.halt:
     cli
     hlt
-    jmp .hang
+    jmp .halt

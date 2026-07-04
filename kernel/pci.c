@@ -4,6 +4,9 @@
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
 
+/* offset gets masked to a dword boundary here; callers needing a specific
+ * byte/word within that dword shift it back out below. */
+
 static uint32_t pci_make_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset)
 {
     return (uint32_t)(0x80000000u |
@@ -31,6 +34,8 @@ uint8_t pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset
     return (uint8_t)((v >> ((offset & 3) * 8)) & 0xFF);
 }
 
+/* Reads the header for one bus/slot/func. Returns 0 if nothing answers
+ * (vendor ID 0xFFFF means no device there). */
 static int pci_probe_device(uint8_t bus, uint8_t slot, uint8_t func, PciDeviceInfo *out)
 {
     uint16_t vendor = pci_config_read16(bus, slot, func, 0x00);
@@ -50,6 +55,9 @@ static int pci_probe_device(uint8_t bus, uint8_t slot, uint8_t func, PciDeviceIn
     return 1;
 }
 
+/* Brute-force scan of every bus/slot/func combination - there's no ACPI
+ * table parsing here, just the full 256*32*8 sweep. Slow in theory, fine
+ * in practice since it only runs once at boot. */
 int pci_find_device_by_id(uint16_t vendor, uint16_t device, PciDeviceInfo *out)
 {
     for (uint16_t b = 0; b < 256; b++) {

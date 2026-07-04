@@ -1,4 +1,5 @@
-/* kernel/explorer.h - the File Explorer app (renders inside a WM window). */
+/* File Explorer app - renders inside a WM window, browses the in-memory
+ * vfs tree. */
 #ifndef PEFIA_EXPLORER_H
 #define PEFIA_EXPLORER_H
 

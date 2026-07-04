@@ -1,6 +1,9 @@
-/* kernel/jpeg.c - baseline (sequential Huffman) JPEG decoder.
- * Supports SOF0, 8-bit, 1 or 3 components, 4:4:4 / 4:2:2 / 4:2:0 subsampling,
- * restart markers. Progressive JPEG is not supported. Integer IDCT, no FPU. */
+/* kernel/jpeg.c - baseline sequential JPEG (SOF0) decoder.
+ * Handles 8-bit, 1 or 3 component images at 4:4:4/4:2:2/4:2:0 subsampling
+ * with restart markers. No progressive JPEG (SOF2) support, and the IDCT
+ * below is fixed-point since there's no FPU to spend on this. Numeric tables
+ * (the IDCT cosine matrix, zigzag order) are exact per the JPEG spec - don't
+ * touch them without checking output against a reference decoder. */
 #include "image.h"
 #include "heap.h"
 

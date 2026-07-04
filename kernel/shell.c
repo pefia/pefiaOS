@@ -1,9 +1,7 @@
 /* kernel/shell.c
- * -----------------------------------------------------------------------------
- * Minimal command shell for pefiaOS, rendered on the graphical console.
- * Built-ins: help, about (neofetch-style), memtest, free, uptime, history,
- * ver, clear, echo.
- * -----------------------------------------------------------------------------
+ * The console-mode shell that used to be the whole UI before the desktop
+ * existed. Built-ins: help, about (neofetch knockoff), memtest, free, uptime,
+ * history, ver, clear, echo.
  */
 #include "shell.h"
 #include "console.h"
@@ -17,8 +15,6 @@
 #include <stddef.h>
 
 #define LINE_MAX 128
-
-/* --- string helpers --- */
 
 static int str_eq(const char *a, const char *b)
 {
@@ -34,10 +30,10 @@ static const char *str_after_prefix(const char *s, const char *prefix)
     return s + i;
 }
 
-/* --- neofetch-style `about` --- */
-
-static color_t a_logo, a_key, a_val, a_bg;
-static int a_row;
+/* neofetch-style `about`: a tiny ASCII logo down the left column with
+ * "label: value" rows printed alongside it. */
+static color_t logo_fg, label_fg, value_fg, about_bg;
+static int about_row;
 
 static const char *LOGO[] = {
     "        ____         ",
@@ -52,55 +48,53 @@ static const char *LOGO[] = {
 #define LOGO_LINES ((int)(sizeof(LOGO) / sizeof(LOGO[0])))
 #define LOGO_COLW  15
 
-/* Print one neofetch row: logo column (left) + "label value" (right). */
-static void row(const char *label, const char *value)
+static void about_row_print(const char *label, const char *value)
 {
-    int i = a_row++;
-    const char *l = (i < LOGO_LINES) ? LOGO[i] : "";
+    int i = about_row++;
+    const char *logo_line = (i < LOGO_LINES) ? LOGO[i] : "";
 
-    con_setcolor(a_logo, a_bg);
-    con_write(l);
-    for (int pad = LOGO_COLW - (int)kstrlen(l); pad > 0; pad--)
+    con_setcolor(logo_fg, about_bg);
+    con_write(logo_line);
+    for (int pad = LOGO_COLW - (int)kstrlen(logo_line); pad > 0; pad--)
         con_putchar(' ');
 
-    con_setcolor(a_key, a_bg);
+    con_setcolor(label_fg, about_bg);
     con_write(label);
-    con_setcolor(a_val, a_bg);
+    con_setcolor(value_fg, about_bg);
     con_write(value);
     con_putchar('\n');
 }
 
-static void color_swatches(void)
+static void about_color_swatches(void)
 {
-    int i = a_row++;
-    const char *l = (i < LOGO_LINES) ? LOGO[i] : "";
-    con_setcolor(a_logo, a_bg);
-    con_write(l);
-    for (int pad = LOGO_COLW - (int)kstrlen(l); pad > 0; pad--)
+    int i = about_row++;
+    const char *logo_line = (i < LOGO_LINES) ? LOGO[i] : "";
+    con_setcolor(logo_fg, about_bg);
+    con_write(logo_line);
+    for (int pad = LOGO_COLW - (int)kstrlen(logo_line); pad > 0; pad--)
         con_putchar(' ');
 
     color_t palette[8] = {
-        fb_rgb(40, 42, 54),  fb_rgb(255, 85, 85),  fb_rgb(80, 250, 123),
+        fb_rgb(40, 42, 54),    fb_rgb(255, 85, 85),  fb_rgb(80, 250, 123),
         fb_rgb(241, 250, 140), fb_rgb(98, 114, 164), fb_rgb(255, 121, 198),
         fb_rgb(139, 233, 253), fb_rgb(248, 248, 242),
     };
     for (int k = 0; k < 8; k++) {
-        con_setcolor(a_val, palette[k]);
+        con_setcolor(value_fg, palette[k]);
         con_write("  ");
     }
-    con_setcolor(a_val, a_bg);
+    con_setcolor(value_fg, about_bg);
     con_putchar('\n');
 }
 
 static void cmd_about(void)
 {
-    a_logo = fb_rgb(120, 200, 255);
-    a_key  = fb_rgb(255, 210, 90);
-    a_val  = fb_rgb(220, 220, 220);
-    a_bg   = fb_rgb(12, 12, 20);
-    a_row  = 0;
+    logo_fg  = fb_rgb(120, 200, 255);
+    label_fg = fb_rgb(255, 210, 90);
+    value_fg = fb_rgb(220, 220, 220);
+    about_bg = fb_rgb(12, 12, 20);
+    about_row = 0;
 
-    /* Dynamic facts. */
     char num[11];
     char mem[24];
     kutoa(g_mem_kb / 1024, num);
@@ -114,82 +108,82 @@ static void cmd_about(void)
     kstrcat(res, "x"); kstrcat(res, d);
 
     con_putchar('\n');
-    row("pefia", "@pefiaOS");
-    row("", "---------------");
-    row("OS:      ", PEFIA_VERSION);
-    row("Host:    ", "x86 PC - BIOS / GRUB2");
-    row("Kernel:  ", "32-bit protected mode");
-    row("Shell:   ", "pefia-sh");
-    row("CPU:     ", "x86 / i686");
-    row("Memory:  ", mem);
-    row("Display: ", res);
-    row("Input:   ", "PS/2 keyboard + mouse");
-    color_swatches();
+    about_row_print("pefia", "@pefiaOS");
+    about_row_print("", "---------------");
+    about_row_print("OS:      ", PEFIA_VERSION);
+    about_row_print("Host:    ", "x86 PC - BIOS / GRUB2");
+    about_row_print("Kernel:  ", "32-bit protected mode");
+    about_row_print("Shell:   ", "pefia-sh");
+    about_row_print("CPU:     ", "x86 / i686");
+    about_row_print("Memory:  ", mem);
+    about_row_print("Display: ", res);
+    about_row_print("Input:   ", "PS/2 keyboard + mouse");
+    about_color_swatches();
     con_putchar('\n');
 
-    con_setcolor(fb_rgb(200, 200, 200), a_bg);
+    con_setcolor(fb_rgb(200, 200, 200), about_bg);
 }
 
-/* --- other built-ins --- */
+/* Foreground/background the rest of the built-ins print with, set once in
+ * shell_run and read back here so a command can restore them after using
+ * its own colors. */
+static color_t shell_fg, shell_bg;
 
-/* Shell foreground/background colours (set up in shell_run). */
-static color_t SH_FG, SH_BG;
-
-/* Print "<label><n> bytes\n" in the current colour. */
-static void print_bytes(const char *label, size_t n)
+static void print_byte_count(const char *label, size_t n)
 {
     char num[11];
     kutoa((uint32_t)n, num);
     con_write(label); con_write(num); con_write(" bytes\n");
 }
 
-/* alloc, stamp+verify a pattern, free every other block, refill, free all. */
+/* Allocates a spread of block sizes, stamps and re-checks a fill pattern,
+ * frees every other block and refills those slots, then frees everything -
+ * a quick smoke test that the allocator isn't leaking or corrupting memory. */
 static void cmd_memtest(void)
 {
     static const int sizes[10] = { 16, 64, 128, 32, 256, 8, 512, 100, 1024, 48 };
     void *blocks[10];
-    int   ok = 1;
+    int   passed = 1;
 
     size_t before = heap_free_bytes();
-    print_bytes("heap free before: ", before);
+    print_byte_count("heap free before: ", before);
 
     for (int i = 0; i < 10; i++) {
         blocks[i] = kmalloc((size_t)sizes[i]);
-        if (!blocks[i]) { ok = 0; continue; }
+        if (!blocks[i]) { passed = 0; continue; }
         kmemset(blocks[i], 0xAB, (size_t)sizes[i]);
     }
-    for (int i = 0; i < 10 && ok; i++) {
+    for (int i = 0; i < 10 && passed; i++) {
         uint8_t *b = (uint8_t *)blocks[i];
-        if (!b) { ok = 0; break; }
+        if (!b) { passed = 0; break; }
         for (int j = 0; j < sizes[i]; j++)
-            if (b[j] != 0xAB) { ok = 0; break; }
+            if (b[j] != 0xAB) { passed = 0; break; }
     }
     for (int i = 0; i < 10; i += 2) kfree(blocks[i]);
     for (int i = 0; i < 10; i += 2) {
         blocks[i] = kmalloc((size_t)sizes[i]);
-        if (!blocks[i]) ok = 0;
+        if (!blocks[i]) passed = 0;
     }
     for (int i = 0; i < 10; i++) kfree(blocks[i]);
 
     size_t after = heap_free_bytes();
-    print_bytes("heap free after:  ", after);
-    if (after != before) ok = 0;   /* leak or coalescing bug */
+    print_byte_count("heap free after:  ", after);
+    if (after != before) passed = 0;   /* leak or a coalescing bug */
 
-    con_setcolor(ok ? fb_rgb(120, 230, 120) : fb_rgb(255, 120, 120), SH_BG);
-    con_write(ok ? "memtest: PASS\n" : "memtest: FAIL\n");
-    con_setcolor(SH_FG, SH_BG);
+    con_setcolor(passed ? fb_rgb(120, 230, 120) : fb_rgb(255, 120, 120), shell_bg);
+    con_write(passed ? "memtest: PASS\n" : "memtest: FAIL\n");
+    con_setcolor(shell_fg, shell_bg);
 }
 
-/* Heap usage: total / used / free, plus a live percentage bar. */
 static void cmd_free(void)
 {
     size_t total = heap_total_bytes();
     size_t freeb = heap_free_bytes();
     size_t used  = total - freeb;
 
-    print_bytes("heap total: ", total);
-    print_bytes("heap used:  ", used);
-    print_bytes("heap free:  ", freeb);
+    print_byte_count("heap total: ", total);
+    print_byte_count("heap used:  ", used);
+    print_byte_count("heap free:  ", freeb);
 
     int pct = total ? (int)((uint64_t)used * 100 / total) : 0;
     char num[11];
@@ -201,15 +195,14 @@ static void cmd_free(void)
     con_write("%\n");
 }
 
-/* Milliseconds since boot -> "up H h M m S s". */
 static void cmd_uptime(void)
 {
-    uint32_t s = clock_ms() / 1000;
+    uint32_t secs = clock_ms() / 1000;
     char num[11];
     con_write("up ");
-    kutoa(s / 3600, num);      con_write(num); con_write(" h ");
-    kutoa((s / 60) % 60, num); con_write(num); con_write(" m ");
-    kutoa(s % 60, num);        con_write(num); con_write(" s\n");
+    kutoa(secs / 3600, num);      con_write(num); con_write(" h ");
+    kutoa((secs / 60) % 60, num); con_write(num); con_write(" m ");
+    kutoa(secs % 60, num);        con_write(num); con_write(" s\n");
 }
 
 static void cmd_ver(void)
@@ -217,27 +210,28 @@ static void cmd_ver(void)
     con_write(PEFIA_VERSION " - 32-bit protected mode, i686\n");
 }
 
-/* --- command history (last HIST_MAX non-empty lines) --- */
-
+/* Ring buffer of the last HIST_MAX non-empty commands. hist_n keeps counting
+ * up forever so cmd_history can tell how many lines have actually been typed
+ * even after the buffer has wrapped. */
 #define HIST_MAX 16
-static char hist[HIST_MAX][LINE_MAX];
-static int  hist_n = 0;                 /* total lines ever recorded */
+static char cmd_history_buf[HIST_MAX][LINE_MAX];
+static int  cmd_history_count = 0;
 
-static void hist_add(const char *line)
+static void history_record(const char *line)
 {
     if (!line[0]) return;
-    kstrcpy(hist[hist_n % HIST_MAX], line);
-    hist_n++;
+    kstrcpy(cmd_history_buf[cmd_history_count % HIST_MAX], line);
+    cmd_history_count++;
 }
 
 static void cmd_history(void)
 {
-    int first = hist_n > HIST_MAX ? hist_n - HIST_MAX : 0;
+    int first = cmd_history_count > HIST_MAX ? cmd_history_count - HIST_MAX : 0;
     char num[11];
-    for (int i = first; i < hist_n; i++) {
+    for (int i = first; i < cmd_history_count; i++) {
         kutoa((uint32_t)(i + 1), num);
         con_write("  "); con_write(num); con_write("  ");
-        con_write(hist[i % HIST_MAX]);
+        con_write(cmd_history_buf[i % HIST_MAX]);
         con_putchar('\n');
     }
 }
@@ -256,15 +250,13 @@ static void cmd_help(void)
     con_write("  echo TEXT   print TEXT back\n");
 }
 
-/* --- shell loop --- */
-
 static void print_prompt(void)
 {
-    con_setcolor(fb_rgb(120, 230, 120), SH_BG);
+    con_setcolor(fb_rgb(120, 230, 120), shell_bg);
     con_write("pefia");
-    con_setcolor(fb_rgb(120, 200, 255), SH_BG);
+    con_setcolor(fb_rgb(120, 200, 255), shell_bg);
     con_write("@pefiaOS");
-    con_setcolor(SH_FG, SH_BG);
+    con_setcolor(shell_fg, shell_bg);
     con_write(":~$ ");
 }
 
@@ -284,9 +276,9 @@ void shell_run(void)
 {
     char line[LINE_MAX];
 
-    SH_FG = fb_rgb(210, 210, 210);
-    SH_BG = fb_rgb(12, 12, 20);
-    con_setcolor(SH_FG, SH_BG);
+    shell_fg = fb_rgb(210, 210, 210);
+    shell_bg = fb_rgb(12, 12, 20);
+    con_setcolor(shell_fg, shell_bg);
     con_write("Type 'help' for a list of commands. Try 'about'.\n\n");
 
     for (;;) {
@@ -294,10 +286,10 @@ void shell_run(void)
         read_line(line);
 
         const char *echo_arg = str_after_prefix(line, "echo ");
-        hist_add(line);
+        history_record(line);
 
         if (line[0] == '\0') {
-            /* empty line */
+            /* nothing typed, just re-prompt */
         } else if (str_eq(line, "help")) {
             cmd_help();
         } else if (str_eq(line, "about")) {
@@ -315,15 +307,15 @@ void shell_run(void)
         } else if (str_eq(line, "clear")) {
             con_clear();
         } else if (str_eq(line, "echo")) {
-            con_putchar('\n');           /* bare echo, like the real thing */
+            con_putchar('\n');   /* bare echo with no args still prints a blank line */
         } else if (echo_arg) {
             con_write(echo_arg);
             con_putchar('\n');
         } else {
-            con_setcolor(fb_rgb(255, 120, 120), SH_BG);
+            con_setcolor(fb_rgb(255, 120, 120), shell_bg);
             con_write("Unknown command: ");
             con_write(line);
-            con_setcolor(SH_FG, SH_BG);
+            con_setcolor(shell_fg, shell_bg);
             con_write("\nType 'help' for a list.\n");
         }
     }

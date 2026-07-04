@@ -1,4 +1,4 @@
-/* kernel/terminal.h - interactive terminal app (runs inside a WM window). */
+/* kernel/terminal.h - a shell that runs inside a window instead of owning the whole screen. */
 #ifndef PEFIA_TERMINAL_H
 #define PEFIA_TERMINAL_H
 

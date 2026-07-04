@@ -1,10 +1,7 @@
-/* kernel/mouse.h
- * -----------------------------------------------------------------------------
- * Software mouse cursor: tracks a position and draws an arrow on the
- * framebuffer, saving/restoring the pixels underneath so it doesn't smear.
- * (The PS/2 hardware reading lives in input.c, which calls mouse_move.)
- * -----------------------------------------------------------------------------
- */
+/* Software mouse cursor. We track a position and draw an arrow straight
+ * onto the framebuffer, saving whatever was underneath first so hiding it
+ * again doesn't leave a trail. The actual PS/2 byte-wrangling lives in
+ * input.c - it calls mouse_move() whenever a packet comes in. */
 #ifndef PEFIA_MOUSE_H
 #define PEFIA_MOUSE_H
 
@@ -15,6 +12,6 @@ void     mouse_move(int dx, int dy);       /* move by a delta, clamp to screen *
 void     mouse_set_buttons(unsigned buttons);
 unsigned mouse_buttons(void);              /* current button bitmask (bit0=left) */
 int      mouse_x(void);
-int      mouse_y(void);          /* boi this is so freakin tuff*/
+int      mouse_y(void);
 
 #endif /* PEFIA_MOUSE_H */

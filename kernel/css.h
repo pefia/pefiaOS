@@ -1,10 +1,10 @@
 /* kernel/css.h
- * -----------------------------------------------------------------------------
- * A compact CSS engine: it parses <style> blocks and inline style="" into a
- * rule list, then cascades user-agent defaults + author rules + inline style
- * into a ComputedStyle for any DOM node. Supports type/.class/#id/descendant
- * selectors with proper specificity ordering and inheritance.
- * -----------------------------------------------------------------------------
+ *
+ * A CSS engine sized for what real pages actually use: it parses <style>
+ * blocks and inline style="" into a flat rule list, then cascades user-agent
+ * defaults + author rules + inline style into a ComputedStyle per node.
+ * Selectors support type/.class/#id/descendant combinators with correct
+ * specificity ordering, plus basic property inheritance.
  */
 #ifndef PEFIA_CSS_H
 #define PEFIA_CSS_H
@@ -35,10 +35,10 @@ typedef struct {
 void css_reset(void);
 void css_add_stylesheet(const char *text, int len);
 
-/* Fill `out` for `node`, inheriting from `parent` (NULL ⇒ document defaults). */
+/* Fills `out` for `node`, inheriting from `parent` (NULL means document defaults). */
 void css_cascade(const DomNode *node, const ComputedStyle *parent, ComputedStyle *out);
 
-/* Parse a CSS color literal (#rgb, #rrggbb, rgb(), or a name). 1 on success. */
+/* Parses a CSS color literal (#rgb, #rrggbb, rgb(), or a name). 1 on success. */
 int  css_parse_color(const char *v, color_t *out);
 
 #endif /* PEFIA_CSS_H */

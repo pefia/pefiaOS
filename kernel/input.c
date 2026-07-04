@@ -1,17 +1,16 @@
-/* kernel/input.c */
 #include "input.h"
 #include "io.h"
 #include "mouse.h"
 
 #include <stdint.h>
 
-#define DATA 0x60
-#define STAT 0x64
+#define PS2_DATA 0x60
+#define PS2_STAT 0x64
 
 #define SC_LSHIFT 0x2A
 #define SC_RSHIFT 0x36
 
-/* US QWERTY, scan code set 1. 0 = no printable character. */
+/* US QWERTY, scan code set 1. 0 means "no printable character". */
 static const char keymap[128] = {
     0,   27,  '1', '2', '3', '4', '5', '6', '7', '8',
     '9', '0', '-', '=', '\b','\t','q', 'w', 'e', 'r',
@@ -30,44 +29,42 @@ static const char keymap_shift[128] = {
     'M', '<', '>', '?', 0,   '*', 0,   ' ', 0,   0,
 };
 
-/* --- PS/2 controller plumbing --- */
+/* --- talking to the 8042 controller --- */
 
-static void wait_write(void) { int t = 100000; while ((inb(STAT) & 2) && t--) { } }
-static void wait_read(void)  { int t = 100000; while (!(inb(STAT) & 1) && t--) { } }
+static void ps2_wait_input_clear(void)  { int t = 100000; while ((inb(PS2_STAT) & 2) && t--) { } }
+static void ps2_wait_output_ready(void) { int t = 100000; while (!(inb(PS2_STAT) & 1) && t--) { } }
 
 static void mouse_command(uint8_t cmd)
 {
-    wait_write(); outb(STAT, 0xD4);   /* address next byte to the mouse */
-    wait_write(); outb(DATA, cmd);
-    wait_read();  (void)inb(DATA);    /* consume the 0xFA ACK */
+    ps2_wait_input_clear(); outb(PS2_STAT, 0xD4);   /* next byte goes to the mouse */
+    ps2_wait_input_clear(); outb(PS2_DATA, cmd);
+    ps2_wait_output_ready(); (void)inb(PS2_DATA);    /* eat the 0xFA ack */
 }
 
 void input_init(void)
 {
-    /* Drain anything pending. */
-    while (inb(STAT) & 1) (void)inb(DATA);
+    while (inb(PS2_STAT) & 1) (void)inb(PS2_DATA);   /* flush anything stale */
 
-    wait_write(); outb(STAT, 0xA8);   /* enable the auxiliary (mouse) port */
+    ps2_wait_input_clear(); outb(PS2_STAT, 0xA8);   /* enable the aux (mouse) port */
 
-    wait_write(); outb(STAT, 0x20);   /* read the controller config byte */
-    wait_read();  uint8_t cfg = inb(DATA);
-    cfg |=  0x02;                      /* enable IRQ12 (harmless when polling) */
-    cfg &= ~0x20;                      /* clear "mouse clock disabled" bit */
-    wait_write(); outb(STAT, 0x60);   /* write config byte back */
-    wait_write(); outb(DATA, cfg);
+    ps2_wait_input_clear(); outb(PS2_STAT, 0x20);   /* read controller config byte */
+    ps2_wait_output_ready(); uint8_t cfg = inb(PS2_DATA);
+    cfg |=  0x02;                      /* enable IRQ12 - harmless while we're polling anyway */
+    cfg &= ~0x20;                      /* clear the mouse-clock-disabled bit */
+    ps2_wait_input_clear(); outb(PS2_STAT, 0x60);   /* write it back */
+    ps2_wait_input_clear(); outb(PS2_DATA, cfg);
 
-    mouse_command(0xF6);              /* set defaults */
-    mouse_command(0xF4);              /* enable data reporting */
+    mouse_command(0xF6);              /* reset to defaults */
+    mouse_command(0xF4);              /* turn on data reporting */
 }
 
-/* --- input handling --- */
+/* --- held-key state for games; see input.h --- */
+static uint8_t key_held[IK_COUNT];
+static uint8_t key_latch[IK_COUNT];
 
-/* --- real-time key state (for games); see input.h --- */
-static uint8_t keydown[IK_COUNT];
-static uint8_t keylatch[IK_COUNT];
-
-/* Map a (possibly 0xE0-extended) scan code to an IK_* slot, or -1. */
-static int sc_state_index(uint8_t code, int ext)
+/* Maps a (possibly 0xE0-extended) scan code to an IK_* slot, -1 if we don't
+ * track that key. */
+static int ik_slot_for(uint8_t code, int ext)
 {
     if (ext) {
         switch (code) {
@@ -90,30 +87,30 @@ static int sc_state_index(uint8_t code, int ext)
 
 int input_key_down(int code)
 {
-    return (code >= 0 && code < IK_COUNT) ? keydown[code] : 0;
+    return (code >= 0 && code < IK_COUNT) ? key_held[code] : 0;
 }
 
 int input_key_pressed(int code)
 {
     if (code < 0 || code >= IK_COUNT) return 0;
-    int v = keylatch[code];
-    keylatch[code] = 0;
-    return v;
+    int was_set = key_latch[code];
+    key_latch[code] = 0;
+    return was_set;
 }
 
-/* --- raw key-event ring (for DOOM); see input.h --- */
+/* --- raw key-event ring for DOOM; see input.h --- */
 #define EVQ_SIZE 128
 static uint8_t evq_code[EVQ_SIZE], evq_press[EVQ_SIZE], evq_ext[EVQ_SIZE];
 static int     evq_head, evq_tail;
 
 static void evq_push(uint8_t code, uint8_t pressed, uint8_t ext)
 {
-    int n = (evq_head + 1) % EVQ_SIZE;
-    if (n == evq_tail) return;        /* full: drop oldest-unread by ignoring */
+    int next = (evq_head + 1) % EVQ_SIZE;
+    if (next == evq_tail) return;   /* queue's full, just drop it */
     evq_code[evq_head]  = code;
     evq_press[evq_head] = pressed;
     evq_ext[evq_head]   = ext;
-    evq_head = n;
+    evq_head = next;
 }
 
 int input_next_event(int *scancode, int *pressed, int *ext)
@@ -128,59 +125,61 @@ int input_next_event(int *scancode, int *pressed, int *ext)
 
 static int handle_key(uint8_t sc)
 {
-    static int shift = 0;
-    static int ext   = 0;
+    static int shift_held = 0;
+    static int pending_ext = 0;
 
-    if (sc == 0xE0) { ext = 1; return 0; }    /* extended-key prefix */
+    if (sc == 0xE0) { pending_ext = 1; return 0; }   /* prefix byte, wait for the next one */
 
-    int     release = sc & 0x80;
+    int     is_release = sc & 0x80;
     uint8_t code    = sc & 0x7F;
-    int     was_ext = ext;
-    ext = 0;
+    int     was_ext = pending_ext;
+    pending_ext = 0;
 
-    /* Queue the raw event for any consumer that wants down+up for every key. */
-    evq_push(code, release ? 0 : 1, (uint8_t)was_ext);
+    /* Anyone consuming raw down/up events wants this regardless of what
+     * the debounced state tracking below decides to do with it. */
+    evq_push(code, is_release ? 0 : 1, (uint8_t)was_ext);
 
-    /* Update real-time state. Typematic repeat resends the make code without a
-     * break, so latch only on the first make (state was previously up). */
-    int idx = sc_state_index(code, was_ext);
-    if (idx >= 0) {
-        if (release) keydown[idx] = 0;
-        else { if (!keydown[idx]) keylatch[idx] = 1; keydown[idx] = 1; }
+    /* Typematic repeat resends the make code without a break in between,
+     * so only latch a fresh "pressed" edge the first time we see it go
+     * down from a released state. */
+    int slot = ik_slot_for(code, was_ext);
+    if (slot >= 0) {
+        if (is_release) key_held[slot] = 0;
+        else { if (!key_held[slot]) key_latch[slot] = 1; key_held[slot] = 1; }
     }
 
-    if (release) {
-        if (code == SC_LSHIFT || code == SC_RSHIFT) shift = 0;
+    if (is_release) {
+        if (code == SC_LSHIFT || code == SC_RSHIFT) shift_held = 0;
         return 0;
     }
-    if (code == SC_LSHIFT || code == SC_RSHIFT) { shift = 1; return 0; }
-    if (was_ext) return 0;            /* extended (arrow) keys: state API only */
+    if (code == SC_LSHIFT || code == SC_RSHIFT) { shift_held = 1; return 0; }
+    if (was_ext) return 0;    /* arrows etc: only exposed through the state API */
 
-    char c = shift ? keymap_shift[code] : keymap[code];
+    char c = shift_held ? keymap_shift[code] : keymap[code];
     return c ? (int)(unsigned char)c : 0;
 }
 
 static void handle_mouse(uint8_t byte)
 {
     static int phase = 0;
-    static int pkt[3];
+    static int packet[3];
 
     switch (phase) {
     case 0:
-        if (!(byte & 0x08)) return;   /* bit3 always set on byte 0: resync */
-        pkt[0] = byte; phase = 1;
+        if (!(byte & 0x08)) return;   /* bit3 should always be set on byte 0 - resync */
+        packet[0] = byte; phase = 1;
         break;
     case 1:
-        pkt[1] = byte; phase = 2;
+        packet[1] = byte; phase = 2;
         break;
     default: {
-        pkt[2] = byte; phase = 0;
-        int flags = pkt[0];
-        if (flags & 0xC0) break;      /* X/Y overflow: drop this packet */
-        int dx = pkt[1] - ((flags << 4) & 0x100);
-        int dy = pkt[2] - ((flags << 3) & 0x100);
+        packet[2] = byte; phase = 0;
+        int flags = packet[0];
+        if (flags & 0xC0) break;      /* overflow flagged, toss this packet */
+        int dx = packet[1] - ((flags << 4) & 0x100);
+        int dy = packet[2] - ((flags << 3) & 0x100);
         mouse_set_buttons((unsigned)(flags & 0x07));
-        mouse_move(dx, -dy);          /* screen Y grows downward */
+        mouse_move(dx, -dy);          /* PS/2 Y is up-positive, screen Y is down-positive */
         break;
     }
     }
@@ -189,10 +188,10 @@ static void handle_mouse(uint8_t byte)
 int input_getchar(void)
 {
     for (;;) {
-        uint8_t st = inb(STAT);
-        if (!(st & 1)) continue;      /* output buffer empty */
-        uint8_t data = inb(DATA);
-        if (st & 0x20) {              /* bit5 set: byte came from the mouse */
+        uint8_t status = inb(PS2_STAT);
+        if (!(status & 1)) continue;      /* nothing in the output buffer yet */
+        uint8_t data = inb(PS2_DATA);
+        if (status & 0x20) {              /* bit5: this byte is from the mouse */
             handle_mouse(data);
             continue;
         }
@@ -201,23 +200,23 @@ int input_getchar(void)
     }
 }
 
-/* Non-blocking sibling of input_getchar: drains every byte currently waiting in
- * the PS/2 buffer (updating the mouse along the way) and returns the first key
- * character seen this call, or 0 if none. The window manager calls this every
- * loop iteration instead of blocking. */
+/* Non-blocking twin of input_getchar(): drains whatever's waiting in the
+ * PS/2 buffer right now (mouse packets get applied along the way) and
+ * returns the first key typed during that drain, or 0. The window manager
+ * calls this every frame instead of blocking on a keypress. */
 int input_poll(void)
 {
-    int key = 0;
+    int first_key = 0;
     for (;;) {
-        uint8_t st = inb(STAT);
-        if (!(st & 1)) break;         /* nothing left to read */
-        uint8_t data = inb(DATA);
-        if (st & 0x20) {
+        uint8_t status = inb(PS2_STAT);
+        if (!(status & 1)) break;         /* buffer's empty, we're done */
+        uint8_t data = inb(PS2_DATA);
+        if (status & 0x20) {
             handle_mouse(data);
         } else {
             int c = handle_key(data);
-            if (c && !key) key = c;   /* keep the first key of this batch */
+            if (c && !first_key) first_key = c;
         }
     }
-    return key;
+    return first_key;
 }

@@ -1,8 +1,7 @@
-/* kernel/heap.h
- * -----------------------------------------------------------------------------
- * First-fit free-list kernel heap, living in the RAM just past _kernel_end.
- * -----------------------------------------------------------------------------
- */
+/* Kernel heap: first-fit free list, carved out of whatever RAM sits past
+ * _kernel_end. Nothing fancy - no slabs, no per-size buckets, just a linked
+ * list of blocks we walk linearly. Good enough for the number of allocations
+ * this OS actually makes. */
 #ifndef PEFIA_HEAP_H
 #define PEFIA_HEAP_H
 

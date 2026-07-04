@@ -1,17 +1,17 @@
-/* kernel/domparse.h - build a DOM tree from an HTML byte stream. */
+/* kernel/domparse.h - turn an HTML byte stream into a DOM tree. */
 #ifndef PEFIA_DOMPARSE_H
 #define PEFIA_DOMPARSE_H
 
 #include "domrt.h"
 
-/* Reset the DOM and parse a full document into it. Returns the document root. */
+/* Resets the DOM and parses a full document into it. Returns the new root. */
 DomNode *dom_parse_document(const char *html, int len);
 
-/* Parse an HTML fragment as children of `parent`, replacing its current
- * children (used by innerHTML = ...). */
+/* Parses an HTML fragment as children of `parent`, discarding whatever
+ * children it had before (this is what innerHTML = ... calls). */
 void     dom_parse_fragment(DomNode *parent, const char *html, int len);
 
-/* Parse an HTML fragment and append its nodes to `parent` (document.write). */
+/* Parses a fragment and appends its nodes to `parent` (document.write). */
 void     dom_parse_append(DomNode *parent, const char *html, int len);
 
 #endif /* PEFIA_DOMPARSE_H */

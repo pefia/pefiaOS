@@ -1,12 +1,11 @@
-/* kernel/mouse.c */
 #include "mouse.h"
 #include "framebuffer.h"
 
-#define CW 12     /* cursor bitmap width  */
-#define CH 19     /* cursor bitmap height */
+#define CURSOR_W 12
+#define CURSOR_H 19
 
-/* 'X' = black outline, '.' = white fill, ' ' = transparent. */
-static const char *cursor[CH] = {
+/* 'X' outlines the arrow, '.' is the white fill, ' ' is left transparent. */
+static const char *cursor_glyph[CURSOR_H] = {
     "X           ",
     "XX          ",
     "X.X         ",
@@ -28,74 +27,73 @@ static const char *cursor[CH] = {
     "      XXXX  ",
 };
 
-static int mx, my;
-static unsigned btns;
-static int enabled = 0, shown = 0;
-static int sx, sy, sw, sh;            /* saved region */
-static color_t under[CH * CW];        /* pixels behind the cursor */
-static color_t col_outline, col_fill;
+static int cur_x, cur_y;
+static unsigned button_mask;
+static int cursor_enabled = 0, cursor_visible = 0;
+static int save_x, save_y, save_w, save_h;   /* region we last drew over */
+static color_t saved_pixels[CURSOR_H * CURSOR_W];
+static color_t color_outline, color_fill;
 
 void mouse_hide(void)
 {
-    if (!enabled || !shown) return;
-    for (int j = 0; j < sh; j++)
-        for (int i = 0; i < sw; i++)
-            fb_put_pixel(sx + i, sy + j, under[j * CW + i]);
-    shown = 0;
+    if (!cursor_enabled || !cursor_visible) return;
+    for (int row = 0; row < save_h; row++)
+        for (int col = 0; col < save_w; col++)
+            fb_put_pixel(save_x + col, save_y + row, saved_pixels[row * CURSOR_W + col]);
+    cursor_visible = 0;
 }
 
 void mouse_show(void)
 {
-    if (!enabled || shown) return;
+    if (!cursor_enabled || cursor_visible) return;
 
-    sx = mx; sy = my; sw = CW; sh = CH;
-    if (sx + sw > fb_width())  sw = fb_width()  - sx;
-    if (sy + sh > fb_height()) sh = fb_height() - sy;
-    if (sw < 0) sw = 0;
-    if (sh < 0) sh = 0;
+    save_x = cur_x; save_y = cur_y; save_w = CURSOR_W; save_h = CURSOR_H;
+    if (save_x + save_w > fb_width())  save_w = fb_width()  - save_x;
+    if (save_y + save_h > fb_height()) save_h = fb_height() - save_y;
+    if (save_w < 0) save_w = 0;
+    if (save_h < 0) save_h = 0;
 
-    for (int j = 0; j < sh; j++)
-        for (int i = 0; i < sw; i++)
-            under[j * CW + i] = fb_get_pixel(sx + i, sy + j);
+    for (int row = 0; row < save_h; row++)
+        for (int col = 0; col < save_w; col++)
+            saved_pixels[row * CURSOR_W + col] = fb_get_pixel(save_x + col, save_y + row);
 
-    for (int j = 0; j < sh; j++) {
-        for (int i = 0; i < sw; i++) {
-            char m = cursor[j][i];
-            if (m == 'X') fb_put_pixel(mx + i, my + j, col_outline);
-            else if (m == '.') fb_put_pixel(mx + i, my + j, col_fill);
+    for (int row = 0; row < save_h; row++) {
+        for (int col = 0; col < save_w; col++) {
+            char mark = cursor_glyph[row][col];
+            if (mark == 'X') fb_put_pixel(cur_x + col, cur_y + row, color_outline);
+            else if (mark == '.') fb_put_pixel(cur_x + col, cur_y + row, color_fill);
         }
     }
-    shown = 1;
+    cursor_visible = 1;
 }
 
 void mouse_move(int dx, int dy)
 {
     mouse_hide();
-    mx += dx; my += dy;
-    if (mx < 0) mx = 0;
-    if (my < 0) my = 0;
-    if (mx > fb_width() - 1)  mx = fb_width() - 1;
-    if (my > fb_height() - 1) my = fb_height() - 1;
+    cur_x += dx; cur_y += dy;
+    if (cur_x < 0) cur_x = 0;
+    if (cur_y < 0) cur_y = 0;
+    if (cur_x > fb_width() - 1)  cur_x = fb_width() - 1;
+    if (cur_y > fb_height() - 1) cur_y = fb_height() - 1;
     mouse_show();
 }
 
 void mouse_set_buttons(unsigned b)
 {
-    btns = b;
-    /* Tint the cursor while the left button is held, for visible feedback. */
-    col_fill = (btns & 0x1) ? fb_rgb(120, 230, 120) : fb_rgb(255, 255, 255);
+    button_mask = b;
+    /* Give some visible feedback while the left button is held down. */
+    color_fill = (button_mask & 0x1) ? fb_rgb(120, 230, 120) : fb_rgb(255, 255, 255);
 }
 
 void mouse_cursor_init(int x, int y)
 {
-    col_outline = fb_rgb(0, 0, 0);
-    col_fill    = fb_rgb(255, 255, 255);
-    mx = x; my = y;
-    enabled = 1; shown = 0;
+    color_outline = fb_rgb(0, 0, 0);
+    color_fill    = fb_rgb(255, 255, 255);
+    cur_x = x; cur_y = y;
+    cursor_enabled = 1; cursor_visible = 0;
     mouse_show();
 }
 
-int mouse_x(void) { return mx; }
-int mouse_y(void) { return my; }
-unsigned mouse_buttons(void) { return btns; }
-
+int mouse_x(void) { return cur_x; }
+int mouse_y(void) { return cur_y; }
+unsigned mouse_buttons(void) { return button_mask; }

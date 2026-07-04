@@ -1,9 +1,7 @@
 /* kernel/multiboot.h
- * -----------------------------------------------------------------------------
- * Just enough of the Multiboot v1 info structure to find the framebuffer and
- * basic memory amounts. Field offsets must match the spec exactly.
- * -----------------------------------------------------------------------------
- */
+ * Just the slice of the Multiboot v1 info struct we actually read: framebuffer
+ * location and basic memory sizes. Field order below must track the spec
+ * exactly - this is laid directly over what GRUB hands us in memory. */
 #ifndef PEFIA_MULTIBOOT_H
 #define PEFIA_MULTIBOOT_H
 

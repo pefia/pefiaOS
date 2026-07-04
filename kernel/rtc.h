@@ -1,4 +1,4 @@
-/* kernel/rtc.h - read wall-clock time from the CMOS real-time clock. */
+/* Wall-clock time from the CMOS RTC. */
 #ifndef PEFIA_RTC_H
 #define PEFIA_RTC_H
 

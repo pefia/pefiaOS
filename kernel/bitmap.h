@@ -1,3 +1,6 @@
+/* Minimal BMP loader - just enough to decode the uncompressed 24/32-bit
+ * files we actually ship as assets, plus a blitter that draws onto the
+ * framebuffer with basic alpha keying. */
 #ifndef PEFIA_BITMAP_H
 #define PEFIA_BITMAP_H
 

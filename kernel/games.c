@@ -1,16 +1,14 @@
 /* kernel/games.c
- * -----------------------------------------------------------------------------
- * Implementation of the five built-in games (see games.h).
  *
- * Rendering model: every game owns an off-screen buffer the size of its window
- * content area. A frame is composed entirely into that buffer, then presented
- * in a single fb_blit() so animation never flickers. The window manager calls
- * game_tick() once per main-loop iteration; each game self-paces against
- * clock_ms() so motion is the same speed regardless of how fast the loop spins.
+ * Seven games sharing one file because they share one problem: an off-screen
+ * buffer sized to the window's content area, composed frame by frame and
+ * flipped onto the screen with a single fb_blit(). game_tick() gets called
+ * once per WM loop iteration and each game paces itself off clock_ms(), so
+ * a slow loop doesn't just make things run in slow motion.
  *
- * Controls come from the real-time key-state API (input.h): arrow keys or WASD
- * for movement, space for the action button (flap / jump / hard-drop / restart).
- * -----------------------------------------------------------------------------
+ * Input is polled straight out of input.h's key-state table - arrows or WASD
+ * to move, space doubles as flap/jump/hard-drop/restart depending on which
+ * game currently owns the window.
  */
 #include "games.h"
 #include "wm.h"
@@ -25,9 +23,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ===========================================================================
- * Shared state
- * ======================================================================== */
+/* Everything below lives inside one Game struct rather than per-game structs
+ * - simpler allocation (one kmalloc, one free) at the cost of every game
+ * carrying the others' dead weight in memory. Window content areas are small
+ * enough that this doesn't matter. */
 
 #define MAX_MW 64
 #define MAX_MH 16
@@ -80,12 +79,11 @@ typedef struct {
     int      k_lives, k_stuck;
 } Game;
 
-/* ===========================================================================
- * Tiny PRNG + integer sine table (no libm in a freestanding kernel)
- * ======================================================================== */
-
+/* xorshift32 - good enough for pipe gaps and tetromino bags, not for anything
+ * that needs to be actually unpredictable. Seeded once from rdtsc() so games
+ * don't all get the same opening layout on every boot. */
 static uint32_t rng_state = 0x2545F491u;
-static int      mod_ready  = 0;
+static int      sin_ready  = 0;
 static int      sintab[360];           /* sin(deg) scaled by 1024 */
 
 static uint32_t grand(void)
@@ -102,10 +100,12 @@ static int grange(int lo, int hi)      /* [lo, hi) */
     return lo + (int)(grand() % (uint32_t)(hi - lo));
 }
 
-/* Bhaskara I's degree-form sine approximation; mirrored for the lower half. */
-static void module_init(void)
+/* Bhaskara I's degree-form sine approximation. Cheap, no libm needed, and
+ * close enough for wall shading in the raycaster - nobody's going to notice
+ * a fraction of a degree of error while running from nothing in particular. */
+static void trig_init(void)
 {
-    if (mod_ready) return;
+    if (sin_ready) return;
     rng_state ^= (uint32_t)rdtsc() | 1u;
     for (int d = 0; d <= 180; d++) {
         int xd  = d * (180 - d);                 /* 0..8100 */
@@ -113,15 +113,13 @@ static void module_init(void)
         sintab[d] = (4 * xd * 1024) / den;
     }
     for (int d = 181; d < 360; d++) sintab[d] = -sintab[d - 180];
-    mod_ready = 1;
+    sin_ready = 1;
 }
 
 static int sind(int a) { a %= 360; if (a < 0) a += 360; return sintab[a]; }
 static int cosd(int a) { return sind(a + 90); }
 
-/* ===========================================================================
- * Off-screen drawing primitives (operate on g->fbuf)
- * ======================================================================== */
+/* --- off-screen drawing, all relative to g->fbuf --- */
 
 static inline void gpx(Game *g, int x, int y, color_t c)
 {
@@ -144,7 +142,8 @@ static void gfill(Game *g, int x, int y, int w, int h, color_t c)
 
 static void gclear(Game *g, color_t c) { gfill(g, 0, 0, g->cw, g->ch, c); }
 
-/* shade a base colour by 0..255 (for distance fog in the raycaster) */
+/* darken a base colour toward black by a 0..255 factor - used for the
+ * raycaster's distance fog and for Snake's head-to-tail gradient */
 static color_t shade(int r, int gg, int b, int s)
 {
     if (s < 0) s = 0;
@@ -152,10 +151,16 @@ static color_t shade(int r, int gg, int b, int s)
     return fb_rgb((uint8_t)(r * s / 255), (uint8_t)(gg * s / 255), (uint8_t)(b * s / 255));
 }
 
-/* ===========================================================================
- * Control helpers (held vs. just-pressed)
- * ======================================================================== */
+/* clamp an int into [lo, hi] - paddles, cameras, grid coords, all the same
+ * shape of bug otherwise */
+static int iclamp(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
 
+/* held-key checks accept either arrow keys or WASD everywhere in this file */
 static int left_held (void) { return input_key_down(IK_LEFT)  || input_key_down(IK_A); }
 static int right_held(void) { return input_key_down(IK_RIGHT) || input_key_down(IK_D); }
 static int up_held   (void) { return input_key_down(IK_UP)    || input_key_down(IK_W); }
@@ -166,13 +171,13 @@ static int right_press(void) { return input_key_pressed(IK_RIGHT) || input_key_p
 static int up_press   (void) { return input_key_pressed(IK_UP)    || input_key_pressed(IK_W); }
 static int down_press (void) { return input_key_pressed(IK_DOWN)  || input_key_pressed(IK_S); }
 static int space_press(void) { return input_key_pressed(IK_SPACE); }
-/* "action" used for flap/jump/restart: space or up/W */
+/* the "do a thing" button - flap, jump, hard drop, restart, whatever the
+ * current game wants space (or up/W) to mean */
 static int act_press  (void) { return input_key_pressed(IK_SPACE) ||
                                       input_key_pressed(IK_UP) || input_key_pressed(IK_W); }
 
-/* ===========================================================================
- * Text overlay helpers (drawn on-screen, after the blit)
- * ======================================================================== */
+/* text HUD, drawn straight onto the screen after the frame's been blitted -
+ * these never touch g->fbuf */
 
 static void label(int x, int y, const char *s, color_t fg, color_t bg)
 {
@@ -189,6 +194,7 @@ static void center_msg(int cx, int cy, int cw, int ch, const char *s, color_t fg
     label(x, y, s, fg, bg);
 }
 
+/* "Score " + 42 -> dst, since none of the games want to hand-roll sprintf */
 static void numlabel(char *dst, const char *pre, int v)
 {
     char n[12];
@@ -197,9 +203,15 @@ static void numlabel(char *dst, const char *pre, int v)
     kstrcat(dst, n);
 }
 
-/* ===========================================================================
- * FLAPPY BIRD
- * ======================================================================== */
+/* Flappy Bird. Vertical position/velocity are kept in 26.6 fixed point (i.e.
+ * shifted left 6) so gravity can be a fraction of a pixel per tick without
+ * everything rounding to zero at small window sizes. */
+
+static int flappy_gap_half(Game *g)
+{
+    int h = g->ch / 6;
+    return h < 44 ? 44 : h;
+}
 
 static void flappy_reset(Game *g)
 {
@@ -207,7 +219,7 @@ static void flappy_reset(Game *g)
     g->f_y = (g->ch / 2) << 6; g->f_vy = 0;
     g->f_pw = g->cw / 10; if (g->f_pw < 30) g->f_pw = 30;
     g->f_spacing = g->cw / 2; if (g->f_spacing < g->f_pw * 3) g->f_spacing = g->f_pw * 3;
-    int gaph = g->ch / 6; if (gaph < 44) gaph = 44;
+    int gaph = flappy_gap_half(g);
     for (int i = 0; i < 3; i++) {
         g->f_px[i]  = g->cw + 40 + i * g->f_spacing;
         g->f_gap[i] = grange(gaph + 12, g->ch - gaph - 12);
@@ -216,37 +228,37 @@ static void flappy_reset(Game *g)
 
 static void flappy_step(Game *g)
 {
-    int gaph = g->ch / 6; if (gaph < 44) gaph = 44;
     if (g->over) { if (act_press()) flappy_reset(g); return; }
+    int gaph = flappy_gap_half(g);
 
     int grav = (g->ch << 6) / 1400; if (grav < 1) grav = 1;
-    int flap = -(g->ch << 6) / 52;
-    int maxv = (g->ch << 6) / 30;
+    int flap_kick = -(g->ch << 6) / 52;
+    int vy_cap = (g->ch << 6) / 30;
 
-    if (act_press()) g->f_vy = flap;
+    if (act_press()) g->f_vy = flap_kick;
     g->f_vy += grav;
-    if (g->f_vy > maxv) g->f_vy = maxv;
+    if (g->f_vy > vy_cap) g->f_vy = vy_cap;
     g->f_y += g->f_vy;
 
-    int br = g->cw / 26; if (br < 8) br = 8;
-    int bx = g->cw / 4;
-    int by = g->f_y >> 6;
+    int radius = g->cw / 26; if (radius < 8) radius = 8;
+    int birdx = g->cw / 4;
+    int birdy = g->f_y >> 6;
 
-    if (by - br < 0) { g->f_y = br << 6; g->f_vy = 0; by = br; }
-    if (by + br >= g->ch) { g->over = 1; if (g->score > g->best) g->best = g->score; return; }
+    if (birdy - radius < 0) { g->f_y = radius << 6; g->f_vy = 0; birdy = radius; }
+    if (birdy + radius >= g->ch) { g->over = 1; if (g->score > g->best) g->best = g->score; return; }
 
-    int speed = g->cw / 180 + 2;
+    int scroll = g->cw / 180 + 2;
     for (int i = 0; i < 3; i++) {
-        g->f_px[i] -= speed;
+        g->f_px[i] -= scroll;
         if (g->f_px[i] < -g->f_pw) {
-            int mx = 0;
-            for (int k = 0; k < 3; k++) if (g->f_px[k] > mx) mx = g->f_px[k];
-            g->f_px[i]  = mx + g->f_spacing;
+            int rightmost = 0;
+            for (int k = 0; k < 3; k++) if (g->f_px[k] > rightmost) rightmost = g->f_px[k];
+            g->f_px[i]  = rightmost + g->f_spacing;
             g->f_gap[i] = grange(gaph + 12, g->ch - gaph - 12);
             g->score++;
         }
-        if (bx + br > g->f_px[i] && bx - br < g->f_px[i] + g->f_pw) {
-            if (by - br < g->f_gap[i] - gaph || by + br > g->f_gap[i] + gaph) {
+        if (birdx + radius > g->f_px[i] && birdx - radius < g->f_px[i] + g->f_pw) {
+            if (birdy - radius < g->f_gap[i] - gaph || birdy + radius > g->f_gap[i] + gaph) {
                 g->over = 1; if (g->score > g->best) g->best = g->score;
             }
         }
@@ -260,7 +272,7 @@ static void flappy_draw(Game *g)
     gfill(g, 0, ground, g->cw, g->ch - ground, fb_rgb(222, 196, 120));
     gfill(g, 0, ground, g->cw, 5, fb_rgb(118, 184, 84));
 
-    int gaph = g->ch / 6; if (gaph < 44) gaph = 44;
+    int gaph = flappy_gap_half(g);
     color_t pipe = fb_rgb(78, 178, 82), lip = fb_rgb(58, 148, 64);
     for (int i = 0; i < 3; i++) {
         int px = g->f_px[i], gy = g->f_gap[i];
@@ -270,13 +282,13 @@ static void flappy_draw(Game *g)
         gfill(g, px - 3, gy + gaph, g->f_pw + 6, 14, lip);
     }
 
-    int br = g->cw / 26; if (br < 8) br = 8;
-    int bx = g->cw / 4, by = g->f_y >> 6;
-    gfill(g, bx - br, by - br, 2 * br, 2 * br, fb_rgb(248, 216, 72));      /* body  */
-    gfill(g, bx - br, by + br - 4, 2 * br, 4, fb_rgb(228, 170, 60));        /* belly */
-    gfill(g, bx + br - 6, by - 5, 6, 6, fb_rgb(255, 255, 255));            /* eye   */
-    gfill(g, bx + br - 3, by - 4, 3, 3, fb_rgb(20, 20, 20));              /* pupil */
-    gfill(g, bx + br, by + 1, 6, 4, fb_rgb(232, 132, 40));               /* beak  */
+    int radius = g->cw / 26; if (radius < 8) radius = 8;
+    int birdx = g->cw / 4, birdy = g->f_y >> 6;
+    gfill(g, birdx - radius, birdy - radius, 2 * radius, 2 * radius, fb_rgb(248, 216, 72));   /* body */
+    gfill(g, birdx - radius, birdy + radius - 4, 2 * radius, 4, fb_rgb(228, 170, 60));         /* belly */
+    gfill(g, birdx + radius - 6, birdy - 5, 6, 6, fb_rgb(255, 255, 255));                      /* eye white */
+    gfill(g, birdx + radius - 3, birdy - 4, 3, 3, fb_rgb(20, 20, 20));                         /* pupil */
+    gfill(g, birdx + radius, birdy + 1, 6, 4, fb_rgb(232, 132, 40));                           /* beak */
 }
 
 static void flappy_overlay(Game *g, int cx, int cy)
@@ -290,9 +302,9 @@ static void flappy_overlay(Game *g, int cx, int cy)
     }
 }
 
-/* ===========================================================================
- * PONG
- * ======================================================================== */
+/* Pong. Right paddle is a CPU that chases the ball's y with a fixed speed
+ * that's deliberately a bit slower than the player's max paddle speed, so
+ * it's beatable rather than a wall. */
 
 static void pong_serve(Game *g, int dir)
 {
@@ -315,37 +327,37 @@ static void pong_reset(Game *g)
 
 static void pong_step(Game *g)
 {
-    int psp = g->ch / 40 + 5;
-    if (up_held())   g->p_lpy -= psp;
-    if (down_held()) g->p_lpy += psp;
-    if (g->p_lpy < 0) g->p_lpy = 0;
-    if (g->p_lpy > g->ch - g->p_ph) g->p_lpy = g->ch - g->p_ph;
+    int player_speed = g->ch / 40 + 5;
+    if (up_held())   g->p_lpy -= player_speed;
+    if (down_held()) g->p_lpy += player_speed;
+    g->p_lpy = iclamp(g->p_lpy, 0, g->ch - g->p_ph);
 
-    int ai = g->ch / 60 + 3;                       /* CPU paddle, slightly beatable */
-    int aimc = g->p_rpy + g->p_ph / 2;
-    if (aimc < g->p_by - 6) g->p_rpy += ai;
-    else if (aimc > g->p_by + 6) g->p_rpy -= ai;
-    if (g->p_rpy < 0) g->p_rpy = 0;
-    if (g->p_rpy > g->ch - g->p_ph) g->p_rpy = g->ch - g->p_ph;
+    int cpu_speed = g->ch / 60 + 3;
+    int cpu_centre = g->p_rpy + g->p_ph / 2;
+    if (cpu_centre < g->p_by - 6) g->p_rpy += cpu_speed;
+    else if (cpu_centre > g->p_by + 6) g->p_rpy -= cpu_speed;
+    g->p_rpy = iclamp(g->p_rpy, 0, g->ch - g->p_ph);
 
     g->p_bx += g->p_bvx; g->p_by += g->p_bvy;
     if (g->p_by < 0) { g->p_by = 0; g->p_bvy = -g->p_bvy; }
     if (g->p_by + g->p_bs > g->ch) { g->p_by = g->ch - g->p_bs; g->p_bvy = -g->p_bvy; }
 
-    int lpx = 14, rpx = g->cw - 14 - g->p_pw;
-    if (g->p_bvx < 0 && g->p_bx <= lpx + g->p_pw && g->p_bx >= lpx - g->p_bs &&
+    /* nudge the y-velocity by where on the paddle the ball landed, so hits
+     * near the edge peel off at an angle instead of a dead bounce-back */
+    int left_face = 14, right_face = g->cw - 14 - g->p_pw;
+    if (g->p_bvx < 0 && g->p_bx <= left_face + g->p_pw && g->p_bx >= left_face - g->p_bs &&
         g->p_by + g->p_bs >= g->p_lpy && g->p_by <= g->p_lpy + g->p_ph) {
-        g->p_bx = lpx + g->p_pw; g->p_bvx = -g->p_bvx;
+        g->p_bx = left_face + g->p_pw; g->p_bvx = -g->p_bvx;
         g->p_bvy += ((g->p_by + g->p_bs / 2) - (g->p_lpy + g->p_ph / 2)) / 8;
     }
-    if (g->p_bvx > 0 && g->p_bx + g->p_bs >= rpx && g->p_bx + g->p_bs <= rpx + g->p_pw + 6 &&
+    if (g->p_bvx > 0 && g->p_bx + g->p_bs >= right_face && g->p_bx + g->p_bs <= right_face + g->p_pw + 6 &&
         g->p_by + g->p_bs >= g->p_rpy && g->p_by <= g->p_rpy + g->p_ph) {
-        g->p_bx = rpx - g->p_bs; g->p_bvx = -g->p_bvx;
+        g->p_bx = right_face - g->p_bs; g->p_bvx = -g->p_bvx;
         g->p_bvy += ((g->p_by + g->p_bs / 2) - (g->p_rpy + g->p_ph / 2)) / 8;
     }
 
-    if (g->p_bx < 0)        { g->p_rs++; pong_serve(g, 1); }
-    if (g->p_bx > g->cw)    { g->p_ls++; pong_serve(g, 0); }
+    if (g->p_bx < 0)     { g->p_rs++; pong_serve(g, 1); }
+    if (g->p_bx > g->cw) { g->p_ls++; pong_serve(g, 0); }
 }
 
 static void pong_draw(Game *g)
@@ -370,9 +382,10 @@ static void pong_overlay(Game *g, int cx, int cy)
     label(cx + g->cw - 36, cy + g->ch - 22, "CPU", fb_rgb(230, 170, 150), fb_rgb(14, 24, 20));
 }
 
-/* ===========================================================================
- * MARIO-STYLE PLATFORMER
- * ======================================================================== */
+/* A Mario-ish platformer. Level is a flat char grid (' ' air, '#' ground/
+ * block, '?' coin block, 'o' coin, 'G' flagpole) walked with an axis-separated
+ * pixel-stepper below rather than a swept AABB - crude, but at TS=24 nothing
+ * moves fast enough per frame for tunnelling to be a problem. */
 
 static char m_at(Game *g, int tx, int ty)
 {
@@ -381,6 +394,7 @@ static char m_at(Game *g, int tx, int ty)
 }
 static int m_solid(char c) { return c == '#' || c == '?'; }
 
+/* would the player's box overlap solid ground if placed at (x, y)? */
 static int m_hits(Game *g, int x, int y)
 {
     if (x < 0) return 1;
@@ -398,6 +412,7 @@ static void m_setrow(Game *g, int r, int c0, int c1, char ch)
         if (c >= 0 && c < g->m_W && r >= 0 && r < g->m_H) g->m_map[r * g->m_W + c] = ch;
 }
 
+/* enemies just pace back and forth 3 tiles either side of their spawn column */
 static void m_addenemy(Game *g, int col)
 {
     if (g->m_ne >= 8) return;
@@ -427,7 +442,7 @@ static void mario_reset(Game *g)
     m_setrow(g, 6, 38, 41, '#'); m_setrow(g, 5, 38, 41, 'o');
     g->m_map[10 * g->m_W + 5] = '?';  g->m_map[10 * g->m_W + 6] = '?';
 
-    for (int r = 7; r < 12; r++) g->m_map[r * g->m_W + 57] = 'G';   /* flag pole */
+    for (int r = 7; r < 12; r++) g->m_map[r * g->m_W + 57] = 'G';   /* end-of-level flagpole */
 
     g->m_ne = 0;
     m_addenemy(g, 12); m_addenemy(g, 26); m_addenemy(g, 45);
@@ -455,19 +470,21 @@ static void mario_step(Game *g)
 
     g->m_vy += 1; if (g->m_vy > 14) g->m_vy = 14;
 
-    int dir = g->m_vx > 0 ? 1 : -1;
+    /* walk into the movement one pixel at a time so we stop exactly at a
+     * wall instead of tunnelling through it and having to resolve overlap */
+    int xdir = g->m_vx > 0 ? 1 : -1;
     for (int s = 0; s < (g->m_vx < 0 ? -g->m_vx : g->m_vx); s++) {
-        if (m_hits(g, g->m_px + dir, g->m_py)) break;
-        g->m_px += dir;
+        if (m_hits(g, g->m_px + xdir, g->m_py)) break;
+        g->m_px += xdir;
     }
-    dir = g->m_vy > 0 ? 1 : -1;
+    int ydir = g->m_vy > 0 ? 1 : -1;
     for (int s = 0; s < (g->m_vy < 0 ? -g->m_vy : g->m_vy); s++) {
-        if (m_hits(g, g->m_px, g->m_py + dir)) { if (dir > 0) g->m_on = 1; g->m_vy = 0; break; }
-        g->m_py += dir;
+        if (m_hits(g, g->m_px, g->m_py + ydir)) { if (ydir > 0) g->m_on = 1; g->m_vy = 0; break; }
+        g->m_py += ydir;
     }
     g->m_on = m_hits(g, g->m_px, g->m_py + 1);
 
-    /* coins / goal under the player's box */
+    /* pick up whatever's under the player's box this frame */
     int x0 = g->m_px / TS, x1 = (g->m_px + PW - 1) / TS;
     int y0 = g->m_py / TS, y1 = (g->m_py + PH - 1) / TS;
     for (int ty = y0; ty <= y1; ty++)
@@ -1266,7 +1283,7 @@ const char *game_title(int kind)
 
 void *game_new(int kind)
 {
-    module_init();
+    trig_init();
     Game *g = (Game *)kmalloc(sizeof(Game));
     if (!g) return NULL;
     kmemset(g, 0, sizeof(Game));

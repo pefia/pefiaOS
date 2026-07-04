@@ -1,7 +1,7 @@
 /* kernel/terminal.c
- * A real little shell in a window. Maintains its own scrollback + input line
- * and runs commands against the VFS and the heap: help, ls, cat, echo, about,
- * meminfo, clear.
+ * A little shell that lives in a window instead of on the boot console: its
+ * own scrollback buffer and input line, running commands against the VFS and
+ * heap (help, ls, cat, echo, about, meminfo, uptime, clear).
  */
 #include "terminal.h"
 #include "wm.h"
@@ -13,39 +13,61 @@
 #include "console.h"
 #include "util.h"
 
-#define TROWS 80
-#define TCOLS 110
+#define TERM_ROWS 80
+#define TERM_COLS 110
 
 typedef struct {
-    char lines[TROWS][TCOLS];
+    char lines[TERM_ROWS][TERM_COLS];
     int  count;
     char input[128];
     int  inlen;
 } Term;
 
-static int streq(const char *a, const char *b)
+static int str_eq(const char *a, const char *b)
 {
     int i = 0;
     while (a[i] && b[i]) { if (a[i] != b[i]) return 0; i++; }
     return a[i] == b[i];
 }
 
-static const char *afterpfx(const char *s, const char *p)
+static const char *str_after_prefix(const char *s, const char *prefix)
 {
     int i = 0;
-    while (p[i]) { if (s[i] != p[i]) return 0; i++; }
+    while (prefix[i]) { if (s[i] != prefix[i]) return 0; i++; }
     return s + i;
 }
 
-static void push(Term *t, const char *s)
+/* Small fixed-buffer line builder so the command handlers below don't each
+ * hand-roll their own append loop over a raw char array. */
+typedef struct { char buf[TERM_COLS]; int len; } LineBuf;
+
+static void lb_reset(LineBuf *lb) { lb->len = 0; lb->buf[0] = '\0'; }
+
+static void lb_str(LineBuf *lb, const char *s)
 {
-    if (t->count >= TROWS) {                 /* scroll the buffer up by one */
-        for (int r = 0; r < TROWS - 1; r++)
-            for (int i = 0; i < TCOLS; i++) t->lines[r][i] = t->lines[r + 1][i];
-        t->count = TROWS - 1;
-    }
+    while (*s && lb->len < TERM_COLS - 1) lb->buf[lb->len++] = *s++;
+    lb->buf[lb->len] = '\0';
+}
+
+static void lb_uint(LineBuf *lb, uint32_t v)
+{
+    char digits[11];
+    kutoa(v, digits);
+    lb_str(lb, digits);
+}
+
+static void scroll_up(Term *t)
+{
+    for (int r = 0; r < TERM_ROWS - 1; r++)
+        kmemmove(t->lines[r], t->lines[r + 1], TERM_COLS);
+    t->count = TERM_ROWS - 1;
+}
+
+static void push_line(Term *t, const char *s)
+{
+    if (t->count >= TERM_ROWS) scroll_up(t);
     int i = 0;
-    for (; s[i] && i < TCOLS - 1; i++) t->lines[t->count][i] = s[i];
+    for (; s[i] && i < TERM_COLS - 1; i++) t->lines[t->count][i] = s[i];
     t->lines[t->count][i] = '\0';
     t->count++;
 }
@@ -54,97 +76,101 @@ void *terminal_new(void)
 {
     Term *t = (Term *)kmalloc(sizeof(Term));
     if (!t) return 0;
-    t->count = 0; t->inlen = 0; t->input[0] = '\0';
-    push(t, "pefiaOS terminal - type 'help'");
+    t->count = 0;
+    t->inlen = 0;
+    t->input[0] = '\0';
+    push_line(t, "pefiaOS terminal - type 'help'");
     return t;
 }
 
-static void exec(Term *t)
+static void run_ls(Term *t)
 {
-    char *cmd = t->input;
+    int kids[64];
+    int n = vfs_children(vfs_root(), kids, 64);
+    for (int i = 0; i < n; i++) {
+        const VNode *v = vfs_node(kids[i]);
+        LineBuf lb;
+        lb_reset(&lb);
+        lb_str(&lb, v->is_dir ? "<dir> " : "      ");
+        lb_str(&lb, v->name);
+        push_line(t, lb.buf);
+    }
+}
 
-    char echo[140];
-    int p = 0;
-    echo[p++] = '$'; echo[p++] = ' ';
-    for (int i = 0; cmd[i] && p < 139; i++) echo[p++] = cmd[i];
-    echo[p] = '\0';
-    push(t, echo);
+static void run_cat(Term *t, const char *filename)
+{
+    int kids[64];
+    int n = vfs_children(vfs_root(), kids, 64);
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        const VNode *v = vfs_node(kids[i]);
+        if (str_eq(v->name, filename)) {
+            found = 1;
+            push_line(t, v->is_dir ? "(is a directory)" : (v->content ? v->content : "(empty)"));
+        }
+    }
+    if (!found) push_line(t, "cat: file not found");
+}
+
+static void run_meminfo(Term *t)
+{
+    LineBuf lb;
+    lb_reset(&lb);
+    lb_str(&lb, "heap free ");
+    lb_uint(&lb, (uint32_t)heap_free_bytes());
+    lb_str(&lb, " of ");
+    lb_uint(&lb, (uint32_t)heap_total_bytes());
+    lb_str(&lb, " bytes");
+    push_line(t, lb.buf);
+}
+
+static void run_uptime(Term *t)
+{
+    uint32_t secs = clock_ms() / 1000;
+    LineBuf lb;
+    lb_reset(&lb);
+    lb_str(&lb, "up ");
+    lb_uint(&lb, secs / 3600); lb_str(&lb, "h ");
+    lb_uint(&lb, (secs / 60) % 60); lb_str(&lb, "m ");
+    lb_uint(&lb, secs % 60); lb_str(&lb, "s");
+    push_line(t, lb.buf);
+}
+
+static void execute(Term *t)
+{
+    const char *cmd = t->input;
+
+    LineBuf echoed;
+    lb_reset(&echoed);
+    lb_str(&echoed, "$ ");
+    lb_str(&echoed, cmd);
+    push_line(t, echoed.buf);
 
     const char *arg;
     if (cmd[0] == '\0') {
-        /* nothing */
-    } else if (streq(cmd, "help")) {
-        push(t, "commands: help  ls  cat <file>  echo <text>  about  meminfo  uptime  clear");
-    } else if (streq(cmd, "ls")) {
-        int kids[64];
-        int n = vfs_children(vfs_root(), kids, 64);
-        for (int i = 0; i < n; i++) {
-            const VNode *v = vfs_node(kids[i]);
-            char line[80];
-            int q = 0;
-            const char *tag = v->is_dir ? "<dir> " : "      ";
-            for (int k = 0; tag[k]; k++) line[q++] = tag[k];
-            for (int k = 0; v->name[k] && q < 79; k++) line[q++] = v->name[k];
-            line[q] = '\0';
-            push(t, line);
-        }
-    } else if ((arg = afterpfx(cmd, "cat ")) != 0) {
-        int kids[64];
-        int n = vfs_children(vfs_root(), kids, 64), found = 0;
-        for (int i = 0; i < n; i++) {
-            const VNode *v = vfs_node(kids[i]);
-            if (streq(v->name, arg)) {
-                found = 1;
-                push(t, v->is_dir ? "(is a directory)" : (v->content ? v->content : "(empty)"));
-            }
-        }
-        if (!found) push(t, "cat: file not found");
-    } else if ((arg = afterpfx(cmd, "echo ")) != 0) {
-        push(t, arg);
-    } else if (streq(cmd, "about")) {
-        push(t, PEFIA_VERSION " - 32-bit hobby OS");
-    } else if (streq(cmd, "meminfo")) {
-        char line[80], num[12];
-        int q = 0;
-        const char *l = "heap free ";
-        for (int i = 0; l[i]; i++) line[q++] = l[i];
-        kutoa((uint32_t)heap_free_bytes(), num);
-        for (int i = 0; num[i]; i++) line[q++] = num[i];
-        const char *l2 = " of ";
-        for (int i = 0; l2[i]; i++) line[q++] = l2[i];
-        kutoa((uint32_t)heap_total_bytes(), num);
-        for (int i = 0; num[i]; i++) line[q++] = num[i];
-        const char *l3 = " bytes";
-        for (int i = 0; l3[i]; i++) line[q++] = l3[i];
-        line[q] = '\0';
-        push(t, line);
-    } else if (streq(cmd, "uptime")) {
-        char line[80], num[12];
-        int q = 0;
-        uint32_t s = clock_ms() / 1000;
-        const char *l = "up ";
-        for (int i = 0; l[i]; i++) line[q++] = l[i];
-        kutoa(s / 3600, num);
-        for (int i = 0; num[i]; i++) line[q++] = num[i];
-        line[q++] = 'h'; line[q++] = ' ';
-        kutoa((s / 60) % 60, num);
-        for (int i = 0; num[i]; i++) line[q++] = num[i];
-        line[q++] = 'm'; line[q++] = ' ';
-        kutoa(s % 60, num);
-        for (int i = 0; num[i]; i++) line[q++] = num[i];
-        line[q++] = 's';
-        line[q] = '\0';
-        push(t, line);
-    } else if (streq(cmd, "clear")) {
+        /* blank line, nothing to do */
+    } else if (str_eq(cmd, "help")) {
+        push_line(t, "commands: help  ls  cat <file>  echo <text>  about  meminfo  uptime  clear");
+    } else if (str_eq(cmd, "ls")) {
+        run_ls(t);
+    } else if ((arg = str_after_prefix(cmd, "cat ")) != 0) {
+        run_cat(t, arg);
+    } else if ((arg = str_after_prefix(cmd, "echo ")) != 0) {
+        push_line(t, arg);
+    } else if (str_eq(cmd, "about")) {
+        push_line(t, PEFIA_VERSION " - 32-bit hobby OS");
+    } else if (str_eq(cmd, "meminfo")) {
+        run_meminfo(t);
+    } else if (str_eq(cmd, "uptime")) {
+        run_uptime(t);
+    } else if (str_eq(cmd, "clear")) {
         t->count = 0;
     } else {
-        char line[80];
-        int q = 0;
-        const char *u = "unknown command: ";
-        for (int i = 0; u[i]; i++) line[q++] = u[i];
-        for (int i = 0; cmd[i] && q < 79; i++) line[q++] = cmd[i];
-        line[q] = '\0';
-        push(t, line);
+        LineBuf lb;
+        lb_reset(&lb);
+        lb_str(&lb, "unknown command: ");
+        lb_str(&lb, cmd);
+        push_line(t, lb.buf);
     }
 }
 
@@ -152,29 +178,35 @@ void terminal_key(Window *w, char c)
 {
     Term *t = (Term *)w->state;
     if (!t) return;
-    if (c == '\n')      { exec(t); t->inlen = 0; t->input[0] = '\0'; }
-    else if (c == '\b') { if (t->inlen > 0) t->input[--t->inlen] = '\0'; }
-    else if (c >= 32 && c < 127 && t->inlen < (int)sizeof(t->input) - 1) {
+
+    if (c == '\n') {
+        execute(t);
+        t->inlen = 0;
+        t->input[0] = '\0';
+    } else if (c == '\b') {
+        if (t->inlen > 0) t->input[--t->inlen] = '\0';
+    } else if (c >= 32 && c < 127 && t->inlen < (int)sizeof(t->input) - 1) {
         t->input[t->inlen++] = c;
         t->input[t->inlen] = '\0';
     }
 }
 
-static void tclip(int x, int y, const char *s, int cols, color_t fg, color_t bg)
+static void draw_clipped(int x, int y, const char *s, int max_cols, color_t fg, color_t bg)
 {
-    char b[160];
-    if (cols <= 0) return;
-    if (cols > 159) cols = 159;
+    char clipped[160];
+    if (max_cols <= 0) return;
+    if (max_cols > 159) max_cols = 159;
     int i = 0;
-    while (s[i] && i < cols) { b[i] = s[i]; i++; }
-    b[i] = '\0';
-    gfx_text(x, y, b, fg, bg);
+    while (s[i] && i < max_cols) { clipped[i] = s[i]; i++; }
+    clipped[i] = '\0';
+    gfx_text(x, y, clipped, fg, bg);
 }
 
 void terminal_paint(Window *w, int cx, int cy, int cw, int ch)
 {
     Term *t = (Term *)w->state;
-    color_t bg = fb_rgb(16, 18, 24), fg = fb_rgb(180, 235, 180);
+    color_t bg = fb_rgb(16, 18, 24);
+    color_t fg = fb_rgb(180, 235, 180);
 
     fb_fill_rect(cx, cy, cw, ch, bg);
     if (!t) return;
@@ -183,18 +215,17 @@ void terminal_paint(Window *w, int cx, int cy, int cw, int ch)
     int rows = (ch - 6) / 16;
     if (rows < 1) return;
 
-    int show  = rows - 1;                       /* last row is the input line */
-    int start = (t->count > show) ? t->count - show : 0;
-    int y = cy + 3, r = 0;
+    int visible_rows = rows - 1;   /* bottom row is reserved for the input line */
+    int first = (t->count > visible_rows) ? t->count - visible_rows : 0;
+    int y = cy + 3, row = 0;
 
-    for (int i = start; i < t->count; i++)
-        tclip(cx + 4, y + (r++) * 16, t->lines[i], cols, fg, bg);
+    for (int i = first; i < t->count; i++)
+        draw_clipped(cx + 4, y + (row++) * 16, t->lines[i], cols, fg, bg);
 
-    char line[160];
-    int p = 0;
-    line[p++] = '$'; line[p++] = ' ';
-    for (int i = 0; t->input[i] && p < 157; i++) line[p++] = t->input[i];
-    line[p++] = '_';
-    line[p] = '\0';
-    tclip(cx + 4, y + r * 16, line, cols, fb_rgb(220, 240, 220), bg);
+    LineBuf prompt;
+    lb_reset(&prompt);
+    lb_str(&prompt, "$ ");
+    lb_str(&prompt, t->input);
+    lb_str(&prompt, "_");
+    draw_clipped(cx + 4, y + row * 16, prompt.buf, cols, fb_rgb(220, 240, 220), bg);
 }

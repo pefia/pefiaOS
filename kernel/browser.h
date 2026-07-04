@@ -1,4 +1,5 @@
-/* kernel/browser.h - simple in-OS browser app with demo HTML/CSS rendering. */
+/* kernel/browser.h - toolbar, address bar, history, and a viewport onto
+ * whatever htmlrender.c makes of the current page. */
 #ifndef PEFIA_BROWSER_H
 #define PEFIA_BROWSER_H
 

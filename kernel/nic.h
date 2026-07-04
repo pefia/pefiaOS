@@ -1,10 +1,8 @@
-/* kernel/nic.h
- * -----------------------------------------------------------------------------
- * Generic network-card front end. Probes the supported NICs (Intel e1000 as
- * used by VirtualBox, then RTL8139 as used by QEMU) and exposes one uniform
- * send/poll/MAC interface to the TCP/IP stack.
- * -----------------------------------------------------------------------------
- */
+/* Generic NIC front end. Tries each network card driver pefiaOS knows
+ * about (Intel e1000, since that's what VirtualBox emulates, then RTL8139
+ * for QEMU) and, whichever wins, exposes one uniform send/poll/MAC
+ * interface so the TCP/IP stack never has to care which one it's talking
+ * to. */
 #ifndef PEFIA_NIC_H
 #define PEFIA_NIC_H
 

@@ -1,93 +1,52 @@
-# Makefile - builds pefiaOS into a bootable ISO with one command: `make`
-# -----------------------------------------------------------------------------
-# Requires the i686-elf cross toolchain on PATH (see toolchain/build-i686-elf.sh)
-# plus: nasm, grub-mkrescue (grub-pc-bin + grub-common), xorriso, and qemu
-# (optional, for `make run`).
-# -----------------------------------------------------------------------------
+# Makefile - one command (`make`) turns the kernel sources into a bootable ISO.
+#
+# Needs the i686-elf cross toolchain on PATH (toolchain/build-i686-elf.sh builds
+# one), plus nasm, grub-mkrescue (grub-pc-bin + grub-common), xorriso, and qemu
+# for `make run`.
 
-# --- toolchain ---
-CC  := i686-elf-gcc
-AS  := nasm
+CC := i686-elf-gcc
+AS := nasm
 
 CFLAGS  := -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Ikernel -MMD -MP
 LDFLAGS := -ffreestanding -O2 -nostdlib -T linker.ld
 LDLIBS  := -lgcc
 
-# --- layout ---
-BUILD   := build
-KERNEL  := $(BUILD)/pefiaos.bin
-ISO     := pefiaOS.iso
-ISODIR  := iso
+BUILD  := build
+KERNEL := $(BUILD)/pefiaos.bin
+ISO    := pefiaOS.iso
+ISODIR := iso
 
-OBJS := \
-    $(BUILD)/boot.o \
-    $(BUILD)/kernel.o \
-    $(BUILD)/framebuffer.o \
-    $(BUILD)/console.o \
-    $(BUILD)/mouse.o \
-    $(BUILD)/input.o \
-    $(BUILD)/heap.o \
-    $(BUILD)/wm.o \
-    $(BUILD)/vfs.o \
-    $(BUILD)/rtc.o \
-    $(BUILD)/explorer.o \
-    $(BUILD)/taskbar.o \
-    $(BUILD)/shell.o \
-	$(BUILD)/terminal.o \
-	$(BUILD)/notepad.o \
-	$(BUILD)/browser.o \
-	$(BUILD)/net.o \
-	$(BUILD)/pci.o \
-	$(BUILD)/rtl8139.o \
-	$(BUILD)/e1000.o \
-	$(BUILD)/nic.o \
-	$(BUILD)/clock.o \
-	$(BUILD)/netstack.o \
-	$(BUILD)/crypto.o \
-	$(BUILD)/tls.o \
-	$(BUILD)/htmlrender.o \
-	$(BUILD)/inflate.o \
-	$(BUILD)/image.o \
-	$(BUILD)/jpeg.o \
-	$(BUILD)/bitmap.o \
-	$(BUILD)/domrt.o \
-	$(BUILD)/domparse.o \
-	$(BUILD)/css.o \
-	$(BUILD)/js.o \
-	$(BUILD)/games.o \
-	$(BUILD)/puredoom.o \
-	$(BUILD)/doom_app.o \
-	$(BUILD)/doom_wad.o \
+# Every kernel/*.c gets built automatically - adding a new source file just
+# means dropping it in kernel/, no list to remember to update here.
+KERNEL_SRCS := $(wildcard kernel/*.c)
+KERNEL_OBJS := $(patsubst kernel/%.c,$(BUILD)/%.o,$(KERNEL_SRCS))
+OBJS        := $(BUILD)/boot.o $(BUILD)/doom_wad.o $(KERNEL_OBJS)
 
-
-# --- top-level target ---
 all: $(ISO)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-# Assemble the NASM boot stub to a 32-bit ELF object.
 $(BUILD)/boot.o: boot/boot.asm | $(BUILD)
 	$(AS) -f elf32 $< -o $@
 
-# Compile each C source to an object.
 $(BUILD)/%.o: kernel/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# PureDOOM is third-party and warns a lot under -Wall -Wextra; build it quietly
-# (and without the stack protector, which we have no runtime support for).
+# PureDOOM is vendored and noisy under -Wall -Wextra; build it quietly and
+# without the stack protector, since we have no runtime support for one.
 $(BUILD)/puredoom.o: kernel/puredoom.c kernel/PureDOOM.h | $(BUILD)
 	$(CC) $(CFLAGS) -w -fno-stack-protector -c $< -o $@
 
-# Embed the DOOM shareware IWAD into the image (incbin is relative to here).
+# Embeds the DOOM shareware IWAD into the image; incbin is relative to the repo
+# root, which is where `make` runs from.
 $(BUILD)/doom_wad.o: boot/doom_wad.asm doom1.wad | $(BUILD)
 	$(AS) -f elf32 $< -o $@
 
-# Link everything into the flat kernel binary per the linker script.
 $(KERNEL): $(OBJS) linker.ld
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-# Sanity check: confirm the binary is a valid Multiboot kernel, then build ISO.
+# grub-file catches a malformed Multiboot header before we burn an ISO around it.
 $(ISO): $(KERNEL) $(ISODIR)/boot/grub/grub.cfg
 	@if ! grub-file --is-x86-multiboot $(KERNEL); then \
 		echo "ERROR: $(KERNEL) is NOT a valid Multiboot kernel"; exit 1; \
@@ -95,13 +54,13 @@ $(ISO): $(KERNEL) $(ISODIR)/boot/grub/grub.cfg
 	cp $(KERNEL) $(ISODIR)/boot/pefiaos.bin
 	grub-mkrescue -o $(ISO) $(ISODIR)
 
-# Convenience: boot the ISO in QEMU with a user-mode-networked RTL8139 NIC so
-# the browser can reach the real internet (SLIRP gives 10.0.2.15 / gw 10.0.2.2).
+# NAT-networked RTL8139 so the browser can reach the real internet
+# (SLIRP hands out 10.0.2.15, gateway 10.0.2.2).
 run: $(ISO)
 	qemu-system-i386 -cdrom $(ISO) -m 256 \
 		-netdev user,id=n0 -device rtl8139,netdev=n0
 
-# Same, but capture all traffic to net.pcap for debugging.
+# Same as `run`, but also captures traffic to net.pcap for debugging.
 run-net: $(ISO)
 	qemu-system-i386 -cdrom $(ISO) -m 256 \
 		-netdev user,id=n0 -device rtl8139,netdev=n0 \
@@ -110,9 +69,8 @@ run-net: $(ISO)
 clean:
 	rm -rf $(BUILD) $(ISO) $(ISODIR)/boot/pefiaos.bin
 
-# Compiler-generated header dependencies (-MMD): editing any kernel/*.h now
-# rebuilds exactly the objects that include it, instead of needing a full
-# `make clean` for the change to be picked up.
+# Per-object header dependencies from -MMD: touching a .h rebuilds only the
+# objects that include it instead of needing a full clean every time.
 -include $(OBJS:.o=.d)
 
 .PHONY: all run run-net clean

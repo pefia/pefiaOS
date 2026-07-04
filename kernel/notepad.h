@@ -1,4 +1,4 @@
-/* kernel/notepad.h - a minimal text editor app. */
+/* kernel/notepad.h - about the simplest text editor that still counts as one. */
 #ifndef PEFIA_NOTEPAD_H
 #define PEFIA_NOTEPAD_H
 

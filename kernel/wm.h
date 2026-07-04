@@ -1,9 +1,6 @@
 /* kernel/wm.h
- * -----------------------------------------------------------------------------
- * Window manager. A window is an info box, the File Explorer, a Terminal, or a
- * Notepad. App-specific data hangs off `state`.
- * -----------------------------------------------------------------------------
- */
+ * The window manager's idea of a window: a rect, a title, a kind, and a
+ * void* for whatever that kind of app needs to remember between frames. */
 #ifndef PEFIA_WM_H
 #define PEFIA_WM_H
 
@@ -34,3 +31,5 @@ const char *wm_title(int i);
 void        wm_raise(int i);
 
 #endif /* PEFIA_WM_H */
+
+

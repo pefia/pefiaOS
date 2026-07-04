@@ -1,11 +1,13 @@
 #include "rtl8139.h"
 #include "io.h"
 #include "heap.h"
+#include "util.h"
 
 #define RTL8139_VENDOR_ID 0x10EC
 #define RTL8139_DEVICE_ID 0x8139
 
-/* Register map (offset from I/O base) */
+/* I/O-mapped register offsets. Nothing fancy - this chip predates MMIO BARs
+ * being the norm, so everything hangs off the legacy port BAR. */
 #define REG_IDR0      0x00
 #define REG_MAR0      0x08
 #define REG_TXSTATUS0 0x10
@@ -23,12 +25,12 @@
 #define REG_MPC       0x4C
 #define REG_BMCR      0x62
 
-/* Chip command bits */
 #define CMD_RESET 0x10
 #define CMD_RX_EN 0x08
 #define CMD_TX_EN 0x04
+#define CMD_BUFE  0x01   /* set when the rx ring has nothing left to hand us */
 
-/* Rx status bits */
+/* Per-packet status word sitting in front of every received frame. */
 #define RX_OK          0x0001
 #define RX_BAD_ALIGN   0x0002
 #define RX_CRC_ERR     0x0004
@@ -37,38 +39,53 @@
 #define RX_ISE_ERR     0x0020
 #define RX_BAR_ERR     0x2000
 
-/* RxConfig: accept broadcast + physical match + wrap + 32K ring */
+/* RxConfig: take broadcast + our own unicast address + wrap the ring on
+ * overrun, 32K ring size, no early-fetch threshold. */
 #define RXCFG_AAP      (1u << 0)
 #define RXCFG_APM      (1u << 1)
 #define RXCFG_AM       (1u << 2)
 #define RXCFG_AB       (1u << 3)
 #define RXCFG_WRAP     (1u << 7)
-/* RBLEN field (bits 12:11): 00=8K 01=16K 10=32K 11=64K (+16 byte header). */
+/* RBLEN (bits 12:11): 00=8K 01=16K 10=32K 11=64K, plus a fixed 16-byte pad. */
 #define RXCFG_RBLEN_32K (2u << 11)
 #define RXCFG_FTH_NONE (7u << 13)
 
-#define RX_BUF_BYTES   (32 * 1024)
-#define RX_BUF_PAD     2048
-#define RX_BUF_SIZE    (RX_BUF_BYTES + RX_BUF_PAD)
+#define RX_RING_BYTES  (32 * 1024)
+#define RX_RING_SLOP   2048   /* the datasheet wants room past the ring for the largest frame */
+#define RX_ALLOC_SIZE  (RX_RING_BYTES + RX_RING_SLOP)
 
-#define TX_BUF_SIZE    2048
-#define TX_DESC_COUNT  4
+#define TX_SLOT_SIZE   2048
+#define TX_SLOT_COUNT  4
 
-static Rtl8139Device g_dev;
-static uint8_t *g_txbuf[TX_DESC_COUNT];
+static Rtl8139Device g_card;
+static uint8_t *g_tx_slot[TX_SLOT_COUNT];
 static rtl8139_rx_cb_t g_rx_cb = 0;
-static uint32_t g_rx_off = 0;
+static uint32_t g_rx_cursor = 0;
 
-static inline uint8_t r8(uint16_t io, uint16_t reg)  { return inb((uint16_t)(io + reg)); }
-static inline uint16_t r16(uint16_t io, uint16_t reg){ return inw((uint16_t)(io + reg)); }
-static inline uint32_t r32(uint16_t io, uint16_t reg){ return inl((uint16_t)(io + reg)); }
-static inline void w8(uint16_t io, uint16_t reg, uint8_t v)   { outb((uint16_t)(io + reg), v); }
-static inline void w16(uint16_t io, uint16_t reg, uint16_t v) { outw((uint16_t)(io + reg), v); }
-static inline void w32(uint16_t io, uint16_t reg, uint32_t v) { outl((uint16_t)(io + reg), v); }
+static inline uint8_t  get8(uint16_t io, uint16_t reg)  { return inb((uint16_t)(io + reg)); }
+static inline uint16_t get16(uint16_t io, uint16_t reg) { return inw((uint16_t)(io + reg)); }
+static inline uint32_t get32(uint16_t io, uint16_t reg) { return inl((uint16_t)(io + reg)); }
+static inline void put8(uint16_t io, uint16_t reg, uint8_t v)   { outb((uint16_t)(io + reg), v); }
+static inline void put16(uint16_t io, uint16_t reg, uint16_t v) { outw((uint16_t)(io + reg), v); }
+static inline void put32(uint16_t io, uint16_t reg, uint32_t v) { outl((uint16_t)(io + reg), v); }
 
-static uint32_t virt_to_phys(void *p)
+/* We're identity-mapped, so this is really just a cast - but keeping it as
+ * its own function means the one place that'd need to change if that ever
+ * stops being true is obvious. */
+static uint32_t phys_of(void *ptr)
 {
-    return (uint32_t)(uintptr_t)p;
+    return (uint32_t)(uintptr_t)ptr;
+}
+
+/* kmalloc doesn't promise any particular alignment, and the NIC wants its
+ * DMA buffers on a 16-byte boundary, so we always ask for a little extra
+ * and slide the pointer forward. */
+static uint8_t *alloc_dma_buf(uint32_t size)
+{
+    uint8_t *raw = (uint8_t *)kmalloc(size + 16);
+    if (!raw) return 0;
+    uintptr_t aligned = ((uintptr_t)raw + 15u) & ~(uintptr_t)15u;
+    return (uint8_t *)aligned;
 }
 
 void rtl8139_set_rx_callback(rtl8139_rx_cb_t cb)
@@ -78,142 +95,150 @@ void rtl8139_set_rx_callback(rtl8139_rx_cb_t cb)
 
 const Rtl8139Device *rtl8139_device(void)
 {
-    return g_dev.present ? &g_dev : 0;
+    return g_card.present ? &g_card : 0;
 }
 
 int rtl8139_probe(Rtl8139Device *out)
 {
-    PciDeviceInfo dev;
-    if (!pci_find_device_by_id(RTL8139_VENDOR_ID, RTL8139_DEVICE_ID, &dev)) return 0;
+    PciDeviceInfo pci_dev;
+    if (!pci_find_device_by_id(RTL8139_VENDOR_ID, RTL8139_DEVICE_ID, &pci_dev)) return 0;
 
     if (out) {
+        kmemset(out, 0, sizeof(*out));
         out->present = 1;
-        out->bus = dev.bus;
-        out->slot = dev.slot;
-        out->func = dev.func;
-        out->io_base = 0;
-        out->irq_line = 0;
-        out->mac[0] = out->mac[1] = out->mac[2] = 0;
-        out->mac[3] = out->mac[4] = out->mac[5] = 0;
-        out->rx_buf = 0;
-        out->rx_buf_phys = 0;
-        out->tx_cur = 0;
+        out->bus = pci_dev.bus;
+        out->slot = pci_dev.slot;
+        out->func = pci_dev.func;
     }
     return 1;
+}
+
+/* Flip on I/O-space access and bus mastering in the PCI command register.
+ * pci.c only exposes reads right now, so we poke CF8/CFC ourselves for the
+ * one write we actually need. */
+static void enable_pci_io_and_master(uint8_t bus, uint8_t slot, uint8_t func)
+{
+    uint16_t cmd = pci_config_read16(bus, slot, func, 0x04);
+    cmd |= 0x0005;
+    outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) | ((uint32_t)func << 8) | 0x04);
+    outl(0xCFC, (uint32_t)cmd);
+}
+
+static int reset_chip(uint16_t io_base)
+{
+    put8(io_base, REG_CONFIG1, 0x00);
+    put8(io_base, REG_CHIPCMD, CMD_RESET);
+    for (int spins = 0; spins < 100000; spins++) {
+        if ((get8(io_base, REG_CHIPCMD) & CMD_RESET) == 0) return 0;
+        io_wait();
+    }
+    return -1; /* chip never cleared the reset bit - caller decides how much to care */
 }
 
 int rtl8139_init(Rtl8139Device *dev)
 {
     if (!dev) return -1;
 
-    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->func, 0x04);
-    cmd |= 0x0005; /* IO space + bus master */
-    /* config write helper absent in pci.c right now; write through CF8/CFC directly */
-    outl(0xCF8, 0x80000000u | ((uint32_t)dev->bus << 16) | ((uint32_t)dev->slot << 11) | ((uint32_t)dev->func << 8) | 0x04);
-    outl(0xCFC, (uint32_t)cmd);
+    enable_pci_io_and_master(dev->bus, dev->slot, dev->func);
 
     uint32_t bar0 = pci_config_read32(dev->bus, dev->slot, dev->func, 0x10);
-    if ((bar0 & 0x1) == 0) return -2;
+    if ((bar0 & 0x1) == 0) return -2; /* BAR0 should be I/O-space; if not, wrong chip or weird BIOS */
     dev->io_base = (uint16_t)(bar0 & 0xFFFC);
-
     dev->irq_line = pci_config_read8(dev->bus, dev->slot, dev->func, 0x3C);
 
-    w8(dev->io_base, REG_CONFIG1, 0x00);
-    w8(dev->io_base, REG_CHIPCMD, CMD_RESET);
-    for (int i = 0; i < 100000; i++) {
-        if ((r8(dev->io_base, REG_CHIPCMD) & CMD_RESET) == 0) break;
-        io_wait();
-    }
+    reset_chip(dev->io_base); /* worst case we proceed with a half-reset card; init below still reprograms everything */
 
-    dev->rx_buf = (uint8_t *)kmalloc(RX_BUF_SIZE + 16);
+    dev->rx_buf = alloc_dma_buf(RX_ALLOC_SIZE);
     if (!dev->rx_buf) return -3;
-    uintptr_t rxp = (uintptr_t)dev->rx_buf;
-    rxp = (rxp + 15u) & ~((uintptr_t)15u);
-    dev->rx_buf = (uint8_t *)rxp;
-    dev->rx_buf_phys = virt_to_phys(dev->rx_buf);
+    dev->rx_buf_phys = phys_of(dev->rx_buf);
 
-    for (int i = 0; i < TX_DESC_COUNT; i++) {
-        g_txbuf[i] = (uint8_t *)kmalloc(TX_BUF_SIZE + 16);
-        if (!g_txbuf[i]) return -4;
-        uintptr_t txp = (uintptr_t)g_txbuf[i];
-        txp = (txp + 15u) & ~((uintptr_t)15u);
-        g_txbuf[i] = (uint8_t *)txp;
-        w32(dev->io_base, (uint16_t)(REG_TXADDR0 + i * 4), virt_to_phys(g_txbuf[i]));
+    for (int slot = 0; slot < TX_SLOT_COUNT; slot++) {
+        g_tx_slot[slot] = alloc_dma_buf(TX_SLOT_SIZE);
+        if (!g_tx_slot[slot]) return -4;
+        put32(dev->io_base, (uint16_t)(REG_TXADDR0 + slot * 4), phys_of(g_tx_slot[slot]));
     }
 
-    w32(dev->io_base, REG_RXBUF, dev->rx_buf_phys);
-    w16(dev->io_base, REG_RXBUFHEAD, 0);
-    w16(dev->io_base, REG_RXBUFTAIL, 0);
-    g_rx_off = 0;
+    put32(dev->io_base, REG_RXBUF, dev->rx_buf_phys);
+    put16(dev->io_base, REG_RXBUFHEAD, 0);
+    put16(dev->io_base, REG_RXBUFTAIL, 0);
+    g_rx_cursor = 0;
 
-    for (int i = 0; i < 8; i++) dev->mac[i % 6] = r8(dev->io_base, (uint16_t)(REG_IDR0 + i));
-    for (int i = 0; i < 8; i++) w8(dev->io_base, (uint16_t)(REG_MAR0 + i), 0x00);
+    /* IDR0..IDR5 hold the burned-in station address, one byte per register */
+    for (int i = 0; i < 6; i++) dev->mac[i] = get8(dev->io_base, (uint16_t)(REG_IDR0 + i));
+    for (int i = 0; i < 8; i++) put8(dev->io_base, (uint16_t)(REG_MAR0 + i), 0x00);
 
-    w32(dev->io_base, REG_MPC, 0);
+    put32(dev->io_base, REG_MPC, 0);
 
-    w32(dev->io_base, REG_RXCONFIG, RXCFG_AAP | RXCFG_APM | RXCFG_AB | RXCFG_WRAP | RXCFG_RBLEN_32K | RXCFG_FTH_NONE);
-    w32(dev->io_base, REG_TXCONFIG, 0x03000700u);
+    put32(dev->io_base, REG_RXCONFIG,
+          RXCFG_AAP | RXCFG_APM | RXCFG_AB | RXCFG_WRAP | RXCFG_RBLEN_32K | RXCFG_FTH_NONE);
+    put32(dev->io_base, REG_TXCONFIG, 0x03000700u);
 
-    w16(dev->io_base, REG_INTRSTAT, 0xFFFF);
-    w16(dev->io_base, REG_INTRMASK, 0x0005);
+    put16(dev->io_base, REG_INTRSTAT, 0xFFFF);
+    put16(dev->io_base, REG_INTRMASK, 0x0005);
 
-    w8(dev->io_base, REG_CHIPCMD, CMD_RX_EN | CMD_TX_EN);
+    put8(dev->io_base, REG_CHIPCMD, CMD_RX_EN | CMD_TX_EN);
 
     dev->tx_cur = 0;
-
-    g_dev = *dev;
+    g_card = *dev;
     return 0;
 }
 
 int rtl8139_send(const void *frame, uint16_t len)
 {
-    if (!g_dev.present || !frame) return -1;
-    if (len < 60) len = 60;
-    if (len > TX_BUF_SIZE) return -2;
+    if (!g_card.present || !frame) return -1;
+    if (len < 60) len = 60;          /* Ethernet minimum payload, chip won't pad it for us */
+    if (len > TX_SLOT_SIZE) return -2;
 
-    uint8_t idx = g_dev.tx_cur & 0x3;
-    uint8_t *tx = g_txbuf[idx];
-    const uint8_t *src = (const uint8_t *)frame;
-    for (uint16_t i = 0; i < len; i++) tx[i] = src[i];
+    uint8_t slot = g_card.tx_cur & (TX_SLOT_COUNT - 1);
+    kmemmove(g_tx_slot[slot], frame, len);
 
-    w32(g_dev.io_base, (uint16_t)(REG_TXSTATUS0 + idx * 4), (uint32_t)len);
-    g_dev.tx_cur = (uint8_t)((g_dev.tx_cur + 1) & 0x3);
+    put32(g_card.io_base, (uint16_t)(REG_TXSTATUS0 + slot * 4), (uint32_t)len);
+    g_card.tx_cur = (uint8_t)((slot + 1) & (TX_SLOT_COUNT - 1));
     return len;
+}
+
+/* Ring got out of sync (bad checksum, runt, whatever) - the datasheet's
+ * prescribed recovery is a TX-only cycle followed by re-enabling RX with
+ * the tail nudged back by 16 (the header size), then start reading from
+ * byte 0 again. */
+static void recover_rx_ring(uint16_t io_base)
+{
+    put8(io_base, REG_CHIPCMD, CMD_TX_EN);
+    put8(io_base, REG_CHIPCMD, CMD_RX_EN | CMD_TX_EN);
+    g_rx_cursor = 0;
+    put16(io_base, REG_RXBUFTAIL, (uint16_t)(0 - 16));
 }
 
 int rtl8139_poll(void)
 {
-    if (!g_dev.present) return 0;
+    if (!g_card.present) return 0;
 
-    uint16_t isr = r16(g_dev.io_base, REG_INTRSTAT);
-    if (isr) w16(g_dev.io_base, REG_INTRSTAT, isr);
+    uint16_t isr = get16(g_card.io_base, REG_INTRSTAT);
+    if (isr) put16(g_card.io_base, REG_INTRSTAT, isr);
 
     int delivered = 0;
-    /* CHIPCMD bit0 (BUFE) set => receive ring empty. */
-    while ((r8(g_dev.io_base, REG_CHIPCMD) & 0x01) == 0) {
-        uint8_t *p = g_dev.rx_buf + g_rx_off;
-        uint16_t rs = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-        uint16_t rl = (uint16_t)(p[2] | ((uint16_t)p[3] << 8)); /* incl 4B CRC */
 
-        if (rl == 0xFFFF) break;               /* still being DMA'd by the NIC */
+    while ((get8(g_card.io_base, REG_CHIPCMD) & CMD_BUFE) == 0) {
+        uint8_t *hdr = g_card.rx_buf + g_rx_cursor;
+        uint16_t status = (uint16_t)(hdr[0] | ((uint16_t)hdr[1] << 8));
+        uint16_t total_len = (uint16_t)(hdr[2] | ((uint16_t)hdr[3] << 8)); /* includes the trailing 4-byte CRC */
 
-        if ((rs & RX_OK) && rl >= 4 && rl <= 1600) {
-            uint16_t frame_len = (uint16_t)(rl - 4);
-            if (g_rx_cb) g_rx_cb(p + 4, frame_len);
-            delivered++;
-        } else {
-            /* Bad packet: reset the ring to recover. */
-            w8(g_dev.io_base, REG_CHIPCMD, CMD_TX_EN);
-            w8(g_dev.io_base, REG_CHIPCMD, CMD_RX_EN | CMD_TX_EN);
-            g_rx_off = 0;
-            w16(g_dev.io_base, REG_RXBUFTAIL, (uint16_t)(0 - 16));
+        if (total_len == 0xFFFF) break; /* NIC is still DMA'ing this one in, come back later */
+
+        if (!(status & RX_OK) || total_len < 4 || total_len > 1600) {
+            recover_rx_ring(g_card.io_base);
             break;
         }
 
-        /* Advance past header(4) + packet(rl), 4-byte aligned, wrap at ring size. */
-        g_rx_off = (uint32_t)((g_rx_off + rl + 4 + 3) & ~3u);
-        g_rx_off %= RX_BUF_BYTES;
-        w16(g_dev.io_base, REG_RXBUFTAIL, (uint16_t)(g_rx_off - 16));
+        uint16_t payload_len = (uint16_t)(total_len - 4);
+        if (g_rx_cb) g_rx_cb(hdr + 4, payload_len);
+        delivered++;
+
+        /* skip the 4-byte header plus the packet, round up to a 4-byte
+         * boundary (the chip requires it), and wrap at the ring size. */
+        g_rx_cursor = (uint32_t)((g_rx_cursor + total_len + 4 + 3) & ~3u);
+        g_rx_cursor %= RX_RING_BYTES;
+        put16(g_card.io_base, REG_RXBUFTAIL, (uint16_t)(g_rx_cursor - 16));
     }
 
     return delivered;

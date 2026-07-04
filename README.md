@@ -193,4 +193,4 @@ Software's GPL-released DOOM source). The embedded [`doom1.wad`](doom1.wad) is t
 redistributed; DOOM © id Software.
 
 The pefiaOS kernel, drivers, network stack, TLS, browser, and games are original
-work. AI has been used to comment and reformat the code for easy readability + efficiency, and debugging Full attribution is in [CREDITS.md](CREDITS.md).
+work. Full attribution is in [CREDITS.md](CREDITS.md).

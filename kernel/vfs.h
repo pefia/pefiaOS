@@ -1,10 +1,6 @@
-/* kernel/vfs.h
- * -----------------------------------------------------------------------------
- * A tiny read-only in-memory filesystem. The File Explorer talks to this
- * abstraction, so a real FAT32-on-disk backend can replace it later without
- * the explorer changing.
- * -----------------------------------------------------------------------------
- */
+/* Read-only in-memory filesystem. The file explorer only ever talks to
+ * this API, so the day someone writes a real FAT32 driver, it can slot in
+ * underneath without the explorer noticing. */
 #ifndef PEFIA_VFS_H
 #define PEFIA_VFS_H
 

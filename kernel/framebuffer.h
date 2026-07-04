@@ -1,9 +1,6 @@
-/* kernel/framebuffer.h
- * -----------------------------------------------------------------------------
- * Linear framebuffer driver. The framebuffer address, pitch, size and pixel
- * format all come from GRUB via the Multiboot info structure.
- * -----------------------------------------------------------------------------
- */
+/* Linear framebuffer driver. GRUB hands us the address, pitch, dimensions
+ * and pixel format through the Multiboot info struct - we just read it
+ * once at boot and poke pixels into it from then on. */
 #ifndef PEFIA_FRAMEBUFFER_H
 #define PEFIA_FRAMEBUFFER_H
 

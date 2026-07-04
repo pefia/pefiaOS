@@ -1,8 +1,6 @@
 /* kernel/util.h
- * -----------------------------------------------------------------------------
- * Tiny freestanding replacements for the libc functions we miss. Header-only.
- * -----------------------------------------------------------------------------
- */
+ * The handful of libc functions we'd otherwise be missing, kept header-only
+ * since there's no libc to link against out here. */
 #ifndef PEFIA_UTIL_H
 #define PEFIA_UTIL_H
 
@@ -51,7 +49,7 @@ static inline char *kstrcat(char *d, const char *s)
     return r;
 }
 
-/* Unsigned int -> decimal string. buf must hold at least 11 bytes. */
+/* uint32 -> decimal string; buf needs at least 11 bytes (10 digits + NUL). */
 static inline char *kutoa(uint32_t v, char *buf)
 {
     char tmp[11];

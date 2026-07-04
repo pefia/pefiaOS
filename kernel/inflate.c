@@ -1,81 +1,100 @@
 #include "inflate.h"
 
-/* A from-scratch DEFLATE decoder (RFC1951) with canonical Huffman decoding. */
+/* Plain DEFLATE decoder, RFC 1951. Nothing fancy: bit-at-a-time reader,
+ * canonical Huffman via the count/symbol table trick from the RFC's own
+ * appendix, and the usual three block types. Window is just "the output
+ * buffer so far" since we always decode into one flat destination rather
+ * than a sliding buffer - fine for the sizes this kernel deals with. */
 
-#define MAXBITS  15
-#define MAXLCODES 288
-#define MAXDCODES 30
-#define MAXCODES  (MAXLCODES + MAXDCODES)
+#define MAXBITS    15
+#define MAXLCODES  288
+#define MAXDCODES  30
+#define MAXCODES   (MAXLCODES + MAXDCODES)
 #define MAXCLCODES 19
 
+/* Bit-reader + output cursor, threaded through every helper below instead
+ * of using globals (this thing might get called for several images while
+ * decoding a page). */
 typedef struct {
     const uint8_t *in;
     int inlen, inpos;
     int bitbuf, bitcnt;
     uint8_t *out;
     int outcap, outpos;
-} State;
+} Reader;
 
+/* Canonical Huffman table: count[len] = how many codes of that bit length,
+ * symbol[] = the symbols in canonical order. See build() below. */
 typedef struct {
     short count[MAXBITS + 1];
     short symbol[MAXCODES];
 } Huff;
 
-static int getbit(State *s)
+static int next_bit(Reader *r)
 {
-    if (s->bitcnt == 0) {
-        if (s->inpos >= s->inlen) return -1;
-        s->bitbuf = s->in[s->inpos++];
-        s->bitcnt = 8;
+    if (r->bitcnt == 0) {
+        if (r->inpos >= r->inlen) return -1;
+        r->bitbuf = r->in[r->inpos++];
+        r->bitcnt = 8;
     }
-    int b = s->bitbuf & 1;
-    s->bitbuf >>= 1;
-    s->bitcnt--;
-    return b;
+    int bit = r->bitbuf & 1;
+    r->bitbuf >>= 1;
+    r->bitcnt--;
+    return bit;
 }
 
-static int getbits(State *s, int n)
+/* DEFLATE packs multi-bit fields LSB-first (unlike Huffman codes, which
+ * are MSB-first - yes, both conventions show up in the same stream). */
+static int next_bits(Reader *r, int n)
 {
     int v = 0;
     for (int i = 0; i < n; i++) {
-        int b = getbit(s);
-        if (b < 0) return -1;
-        v |= b << i;
+        int bit = next_bit(r);
+        if (bit < 0) return -1;
+        v |= bit << i;
     }
     return v;
 }
 
-static void build(Huff *h, const uint8_t *lengths, int n)
+/* Turn a list of per-symbol code lengths into a canonical Huffman table.
+ * Standard two-pass approach: count how many symbols land at each length,
+ * then walk the symbols again and slot each one into its length's bucket
+ * in ascending symbol order. */
+static void build_table(Huff *h, const uint8_t *lengths, int n)
 {
     for (int i = 0; i <= MAXBITS; i++) h->count[i] = 0;
     for (int i = 0; i < n; i++) h->count[lengths[i]]++;
 
-    short offs[MAXBITS + 1];
-    offs[1] = 0;
-    for (int len = 1; len < MAXBITS; len++) offs[len + 1] = offs[len] + h->count[len];
+    short bucket_start[MAXBITS + 1];
+    bucket_start[1] = 0;
+    for (int len = 1; len < MAXBITS; len++)
+        bucket_start[len + 1] = bucket_start[len] + h->count[len];
 
     for (int sym = 0; sym < n; sym++)
-        if (lengths[sym]) h->symbol[offs[lengths[sym]]++] = (short)sym;
+        if (lengths[sym]) h->symbol[bucket_start[lengths[sym]]++] = (short)sym;
 }
 
-/* Decode one symbol using canonical Huffman code (codes packed MSB-first). */
-static int decode_sym(State *s, const Huff *h)
+/* Pull one Huffman symbol off the bitstream. Codes are MSB-first and of
+ * varying length, so we grow the candidate code bit by bit and check it
+ * against the range of codes assigned to that length. */
+static int read_symbol(Reader *r, const Huff *h)
 {
-    int code = 0, first = 0, index = 0;
+    int code = 0, first_code = 0, table_index = 0;
     for (int len = 1; len <= MAXBITS; len++) {
-        int b = getbit(s);
-        if (b < 0) return -1;
-        code |= b;
+        int bit = next_bit(r);
+        if (bit < 0) return -1;
+        code |= bit;
         int count = h->count[len];
-        if (code - first < count) return h->symbol[index + (code - first)];
-        index += count;
-        first += count;
-        first <<= 1;
+        if (code - first_code < count) return h->symbol[table_index + (code - first_code)];
+        table_index += count;
+        first_code = (first_code + count) << 1;
         code <<= 1;
     }
     return -1;
 }
 
+/* Length/distance tables from RFC 1951 section 3.2.5 - do not touch, these
+ * are the standard's numbers, not something to "clean up". */
 static const short LEN_BASE[29] = {
     3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
 static const short LEN_EXTRA[29] = {
@@ -85,166 +104,209 @@ static const short DIST_BASE[30] = {
 static const short DIST_EXTRA[30] = {
     0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
 
-static int inflate_block_data(State *s, const Huff *lh, const Huff *dh)
+/* Decode literal/length/distance symbols until we hit the end-of-block
+ * marker (256), copying matched runs straight out of what we've already
+ * written to out - that's the whole "LZ77" part of DEFLATE. */
+static int run_block(Reader *r, const Huff *litlen, const Huff *dist)
 {
     for (;;) {
-        int sym = decode_sym(s, lh);
+        int sym = read_symbol(r, litlen);
         if (sym < 0) return -1;
-        if (sym == 256) return 0;            /* end of block */
+        if (sym == 256) return 0;
         if (sym < 256) {
-            if (s->outpos >= s->outcap) return -1;
-            s->out[s->outpos++] = (uint8_t)sym;
-        } else {
-            sym -= 257;
-            if (sym >= 29) return -1;
-            int len = LEN_BASE[sym];
-            int e = LEN_EXTRA[sym];
-            if (e) { int x = getbits(s, e); if (x < 0) return -1; len += x; }
-
-            int dsym = decode_sym(s, dh);
-            if (dsym < 0 || dsym >= 30) return -1;
-            int dist = DIST_BASE[dsym];
-            e = DIST_EXTRA[dsym];
-            if (e) { int x = getbits(s, e); if (x < 0) return -1; dist += x; }
-
-            if (dist > s->outpos) return -1;
-            if (s->outpos + len > s->outcap) return -1;
-            int from = s->outpos - dist;
-            for (int i = 0; i < len; i++) s->out[s->outpos + i] = s->out[from + i];
-            s->outpos += len;
+            if (r->outpos >= r->outcap) return -1;
+            r->out[r->outpos++] = (uint8_t)sym;
+            continue;
         }
+
+        sym -= 257;
+        if (sym >= 29) return -1;
+        int len = LEN_BASE[sym];
+        if (LEN_EXTRA[sym]) {
+            int extra = next_bits(r, LEN_EXTRA[sym]);
+            if (extra < 0) return -1;
+            len += extra;
+        }
+
+        int dsym = read_symbol(r, dist);
+        if (dsym < 0 || dsym >= 30) return -1;
+        int back = DIST_BASE[dsym];
+        if (DIST_EXTRA[dsym]) {
+            int extra = next_bits(r, DIST_EXTRA[dsym]);
+            if (extra < 0) return -1;
+            back += extra;
+        }
+
+        /* back-reference can't point before the start of the output,
+         * and the copy has to fit in what's left of the buffer */
+        if (back > r->outpos) return -1;
+        if (r->outpos + len > r->outcap) return -1;
+        int src = r->outpos - back;
+        for (int i = 0; i < len; i++) r->out[r->outpos + i] = r->out[src + i];
+        r->outpos += len;
     }
 }
 
-static int fixed_block(State *s)
+/* Block type 1: literal/length and distance codes are fixed by the spec
+ * rather than transmitted, so build them once and reuse across calls. */
+static int fixed_huffman_block(Reader *r)
 {
-    static Huff lh, dh;
-    static int built = 0;
-    if (!built) {
-        uint8_t ll[288];
-        for (int i = 0;   i < 144; i++) ll[i] = 8;
-        for (int i = 144; i < 256; i++) ll[i] = 9;
-        for (int i = 256; i < 280; i++) ll[i] = 7;
-        for (int i = 280; i < 288; i++) ll[i] = 8;
-        build(&lh, ll, 288);
-        uint8_t dl[30];
-        for (int i = 0; i < 30; i++) dl[i] = 5;
-        build(&dh, dl, 30);
-        built = 1;
+    static Huff litlen, dist;
+    static int ready = 0;
+    if (!ready) {
+        uint8_t lens[288];
+        for (int i = 0;   i < 144; i++) lens[i] = 8;
+        for (int i = 144; i < 256; i++) lens[i] = 9;
+        for (int i = 256; i < 280; i++) lens[i] = 7;
+        for (int i = 280; i < 288; i++) lens[i] = 8;
+        build_table(&litlen, lens, 288);
+
+        uint8_t dlens[30];
+        for (int i = 0; i < 30; i++) dlens[i] = 5;
+        build_table(&dist, dlens, 30);
+        ready = 1;
     }
-    return inflate_block_data(s, &lh, &dh);
+    return run_block(r, &litlen, &dist);
 }
 
-static int dynamic_block(State *s)
+/* Both the "repeat previous length" and "repeat zero" code-length symbols
+ * (16/17/18) boil down to "write the same value N more times, but stop
+ * early if we hit the declared total" - shared here instead of copy-pasted
+ * three times. */
+static void fill_run(uint8_t *lengths, int *n, int total, int count, uint8_t value)
 {
-    int hlit = getbits(s, 5); if (hlit < 0) return -1; hlit += 257;
-    int hdist = getbits(s, 5); if (hdist < 0) return -1; hdist += 1;
-    int hclen = getbits(s, 4); if (hclen < 0) return -1; hclen += 4;
+    while (count-- && *n < total) lengths[(*n)++] = value;
+}
+
+/* Block type 2: literal/length and distance code lengths are themselves
+ * Huffman-coded using a third table (the "code length" alphabet), which
+ * is what HCLEN/the ORDER permutation below are about. */
+static int dynamic_huffman_block(Reader *r)
+{
+    int hlit = next_bits(r, 5);   if (hlit  < 0) return -1; hlit  += 257;
+    int hdist = next_bits(r, 5);  if (hdist < 0) return -1; hdist += 1;
+    int hclen = next_bits(r, 4);  if (hclen < 0) return -1; hclen += 4;
     if (hlit > 286 || hdist > 30) return -1;
 
-    static const uint8_t ORDER[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+    static const uint8_t CL_ORDER[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
     uint8_t cl_lengths[19];
     for (int i = 0; i < 19; i++) cl_lengths[i] = 0;
-    for (int i = 0; i < hclen; i++) { int v = getbits(s, 3); if (v < 0) return -1; cl_lengths[ORDER[i]] = (uint8_t)v; }
+    for (int i = 0; i < hclen; i++) {
+        int v = next_bits(r, 3);
+        if (v < 0) return -1;
+        cl_lengths[CL_ORDER[i]] = (uint8_t)v;
+    }
 
-    Huff clh;
-    build(&clh, cl_lengths, 19);
+    Huff cl_table;
+    build_table(&cl_table, cl_lengths, 19);
 
     uint8_t lengths[MAXLCODES + MAXDCODES];
+    int total = hlit + hdist;
     int n = 0;
-    while (n < hlit + hdist) {
-        int sym = decode_sym(s, &clh);
+    while (n < total) {
+        int sym = read_symbol(r, &cl_table);
         if (sym < 0) return -1;
         if (sym < 16) {
             lengths[n++] = (uint8_t)sym;
         } else if (sym == 16) {
-            if (n == 0) return -1;
-            int rep = getbits(s, 2); if (rep < 0) return -1; rep += 3;
-            uint8_t prev = lengths[n - 1];
-            while (rep-- && n < hlit + hdist) lengths[n++] = prev;
+            if (n == 0) return -1;             /* nothing previous to repeat */
+            int rep = next_bits(r, 2);
+            if (rep < 0) return -1;
+            fill_run(lengths, &n, total, rep + 3, lengths[n - 1]);
         } else if (sym == 17) {
-            int rep = getbits(s, 3); if (rep < 0) return -1; rep += 3;
-            while (rep-- && n < hlit + hdist) lengths[n++] = 0;
-        } else { /* sym == 18 */
-            int rep = getbits(s, 7); if (rep < 0) return -1; rep += 11;
-            while (rep-- && n < hlit + hdist) lengths[n++] = 0;
+            int rep = next_bits(r, 3);
+            if (rep < 0) return -1;
+            fill_run(lengths, &n, total, rep + 3, 0);
+        } else {
+            int rep = next_bits(r, 7);
+            if (rep < 0) return -1;
+            fill_run(lengths, &n, total, rep + 11, 0);
         }
     }
-    if (n != hlit + hdist) return -1;
+    if (n != total) return -1;
 
-    Huff lh, dh;
-    build(&lh, lengths, hlit);
-    build(&dh, lengths + hlit, hdist);
-    return inflate_block_data(s, &lh, &dh);
+    Huff litlen, dist;
+    build_table(&litlen, lengths, hlit);
+    build_table(&dist, lengths + hlit, hdist);
+    return run_block(r, &litlen, &dist);
 }
 
-static int stored_block(State *s)
+/* Block type 0: no compression, just LEN bytes copied verbatim after
+ * padding out to the next byte boundary and skipping LEN's redundant
+ * complement (NLEN). */
+static int stored_block(Reader *r)
 {
-    s->bitcnt = 0;                            /* align to byte boundary */
-    if (s->inpos + 4 > s->inlen) return -1;
-    int len = s->in[s->inpos] | (s->in[s->inpos + 1] << 8);
-    s->inpos += 4;                            /* skip LEN + NLEN */
-    if (s->inpos + len > s->inlen) return -1;
-    if (s->outpos + len > s->outcap) return -1;
-    for (int i = 0; i < len; i++) s->out[s->outpos++] = s->in[s->inpos++];
+    r->bitcnt = 0;
+    if (r->inpos + 4 > r->inlen) return -1;
+    int len = r->in[r->inpos] | (r->in[r->inpos + 1] << 8);
+    r->inpos += 4;
+    if (r->inpos + len > r->inlen) return -1;
+    if (r->outpos + len > r->outcap) return -1;
+    for (int i = 0; i < len; i++) r->out[r->outpos++] = r->in[r->inpos++];
     return 0;
 }
 
 int inflate_raw(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 {
-    State s;
-    s.in = src; s.inlen = srclen; s.inpos = 0;
-    s.bitbuf = 0; s.bitcnt = 0;
-    s.out = dst; s.outcap = dstcap; s.outpos = 0;
+    Reader r;
+    r.in = src; r.inlen = srclen; r.inpos = 0;
+    r.bitbuf = 0; r.bitcnt = 0;
+    r.out = dst; r.outcap = dstcap; r.outpos = 0;
 
-    int last;
+    int final_block;
     do {
-        last = getbit(&s);
-        if (last < 0) return -1;
-        int type = getbits(&s, 2);
-        if (type < 0) return -1;
-        int r;
-        if (type == 0) r = stored_block(&s);
-        else if (type == 1) r = fixed_block(&s);
-        else if (type == 2) r = dynamic_block(&s);
-        else return -1;
-        if (r < 0) return -1;
-    } while (!last);
+        final_block = next_bit(&r);
+        if (final_block < 0) return -1;
+        int type = next_bits(&r, 2);
 
-    return s.outpos;
+        int status;
+        switch (type) {
+            case 0:  status = stored_block(&r); break;
+            case 1:  status = fixed_huffman_block(&r); break;
+            case 2:  status = dynamic_huffman_block(&r); break;
+            default: return -1;                /* type 3 is reserved/invalid */
+        }
+        if (status < 0) return -1;
+    } while (!final_block);
+
+    return r.outpos;
 }
 
 int zlib_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 {
     if (srclen < 2) return -1;
-    if ((src[0] & 0x0F) != 8) return -1;      /* CM must be deflate */
-    if (((src[0] << 8) | src[1]) % 31 != 0) return -1;
-    int hlen = 2;
-    if (src[1] & 0x20) hlen += 4;             /* FDICT present */
-    return inflate_raw(src + hlen, srclen - hlen, dst, dstcap);
+    if ((src[0] & 0x0F) != 8) return -1;               /* CM: must be deflate */
+    if (((src[0] << 8) | src[1]) % 31 != 0) return -1; /* header checksum */
+
+    int header_len = 2;
+    if (src[1] & 0x20) header_len += 4;                /* preset dictionary present */
+    return inflate_raw(src + header_len, srclen - header_len, dst, dstcap);
 }
 
 int gzip_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 {
     if (srclen < 18) return -1;
     if (src[0] != 0x1F || src[1] != 0x8B || src[2] != 8) return -1;
-    int flg = src[3];
-    int p = 10;
-    if (flg & 0x04) {                          /* FEXTRA */
-        if (p + 2 > srclen) return -1;
-        int xlen = src[p] | (src[p + 1] << 8);
-        p += 2 + xlen;
+
+    int flags = src[3];
+    int pos = 10;
+    if (flags & 0x04) {                                /* FEXTRA */
+        if (pos + 2 > srclen) return -1;
+        int xlen = src[pos] | (src[pos + 1] << 8);
+        pos += 2 + xlen;
     }
-    if (flg & 0x08) { while (p < srclen && src[p]) p++; p++; }   /* FNAME */
-    if (flg & 0x10) { while (p < srclen && src[p]) p++; p++; }   /* FCOMMENT */
-    if (flg & 0x02) p += 2;                    /* FHCRC */
-    if (p >= srclen) return -1;
-    return inflate_raw(src + p, srclen - p, dst, dstcap);
+    if (flags & 0x08) { while (pos < srclen && src[pos]) pos++; pos++; }  /* FNAME */
+    if (flags & 0x10) { while (pos < srclen && src[pos]) pos++; pos++; }  /* FCOMMENT */
+    if (flags & 0x02) pos += 2;                        /* FHCRC */
+    if (pos >= srclen) return -1;
+    return inflate_raw(src + pos, srclen - pos, dst, dstcap);
 }
 
 int auto_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 {
-    if (srclen >= 2 && src[0] == 0x1F && src[1] == 0x8B) return gzip_inflate(src, srclen, dst, dstcap);
-    if (srclen >= 2 && (src[0] & 0x0F) == 8 && (((src[0] << 8) | src[1]) % 31 == 0)) return zlib_inflate(src, srclen, dst, dstcap);
+    if (srclen >= 2 && src[0] == 0x1F && src[1] == 0x8B)
+        return gzip_inflate(src, srclen, dst, dstcap);
+    if (srclen >= 2 && (src[0] & 0x0F) == 8 && ((src[0] << 8) | src[1]) % 31 == 0)
+        return zlib_inflate(src, srclen, dst, dstcap);
     return inflate_raw(src, srclen, dst, dstcap);
 }

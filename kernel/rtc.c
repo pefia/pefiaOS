@@ -1,7 +1,6 @@
-/* kernel/rtc.c
- * Reads hours/minutes/seconds from the CMOS RTC (ports 0x70/0x71). No
- * interrupts needed - we just poll it whenever the taskbar repaints.
- */
+/* CMOS RTC access via ports 0x70/0x71. No interrupts, no periodic update
+ * IRQ - the taskbar just polls this each time it redraws the clock, which
+ * is cheap enough that nobody's bothered wiring up anything smarter. */
 #include "rtc.h"
 #include "io.h"
 #include <stdint.h>
@@ -14,19 +13,19 @@ static uint8_t cmos_read(int reg)
 
 void rtc_time(int *h, int *m, int *s)
 {
-    uint8_t ss = cmos_read(0x00);
-    uint8_t mm = cmos_read(0x02);
-    uint8_t hh = cmos_read(0x04);
-    uint8_t st = cmos_read(0x0B);     /* status register B */
+    uint8_t sec  = cmos_read(0x00);
+    uint8_t min  = cmos_read(0x02);
+    uint8_t hour = cmos_read(0x04);
+    uint8_t status_b = cmos_read(0x0B);
 
-    if (!(st & 0x04)) {               /* bit2 clear => values are BCD, convert */
-        ss = (uint8_t)((ss & 0x0F) + ((ss >> 4) * 10));
-        mm = (uint8_t)((mm & 0x0F) + ((mm >> 4) * 10));
-        hh = (uint8_t)(((hh & 0x0F) + (((hh & 0x70) >> 4) * 10)) | (hh & 0x80));
+    if (!(status_b & 0x04)) {   /* bit2 clear means the registers are BCD, not binary */
+        sec  = (uint8_t)((sec & 0x0F) + ((sec >> 4) * 10));
+        min  = (uint8_t)((min & 0x0F) + ((min >> 4) * 10));
+        hour = (uint8_t)(((hour & 0x0F) + (((hour & 0x70) >> 4) * 10)) | (hour & 0x80));
     }
-    if (!(st & 0x02) && (hh & 0x80)) {/* 12-hour PM flag set => make it 24h */
-        hh = (uint8_t)(((hh & 0x7F) + 12) % 24);
+    if (!(status_b & 0x02) && (hour & 0x80)) {   /* 12h mode with the PM flag set */
+        hour = (uint8_t)(((hour & 0x7F) + 12) % 24);
     }
 
-    *s = ss; *m = mm; *h = hh;
+    *s = sec; *m = min; *h = hour;
 }

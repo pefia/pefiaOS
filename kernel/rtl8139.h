@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include "pci.h"
 
+/* Everything nic.c needs to know about the card we found. rx_buf/rx_buf_phys
+ * are filled in once rtl8139_init() has actually allocated the DMA ring -
+ * they're garbage (well, zero) before that. */
 typedef struct {
     int      present;
     uint8_t  bus;

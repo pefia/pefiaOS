@@ -1,18 +1,14 @@
-/* kernel/clock.h
- * -----------------------------------------------------------------------------
- * A coarse millisecond time source built on the CPU timestamp counter (rdtsc),
- * calibrated once against the CMOS real-time clock. There is no PIT/APIC timer
- * wired up in pefiaOS, so the network stack uses this for its timeouts and
- * retransmission pacing.
- * -----------------------------------------------------------------------------
- */
+/* Millisecond time source built on the CPU's TSC, calibrated once against
+ * the CMOS RTC at boot. pefiaOS has no PIT or APIC timer wired up, so
+ * anything that needs coarse timing - the network stack's retransmit
+ * pacing, mainly - ends up here instead. */
 #ifndef PEFIA_CLOCK_H
 #define PEFIA_CLOCK_H
 
 #include <stdint.h>
 
-/* Measure the TSC frequency against the RTC. Blocks up to ~2 seconds. Safe to
- * call more than once (only the first call performs the calibration). */
+/* Measures TSC frequency against the RTC. Blocks up to ~2 seconds. Safe
+ * to call more than once - only the first call actually calibrates. */
 void     clock_init(void);
 
 /* Milliseconds elapsed since clock_init(). Monotonic. */
