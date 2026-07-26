@@ -1,9 +1,3 @@
-/* kernel/jpeg.c - baseline sequential JPEG (SOF0) decoder.
- * Handles 8-bit, 1 or 3 component images at 4:4:4/4:2:2/4:2:0 subsampling
- * with restart markers. No progressive JPEG (SOF2) support, and the IDCT
- * below is fixed-point since there's no FPU to spend on this. Numeric tables
- * (the IDCT cosine matrix, zigzag order) are exact per the JPEG spec - don't
- * touch them without checking output against a reference decoder. */
 #include "image.h"
 #include "heap.h"
 
@@ -45,8 +39,8 @@ static int fill_byte(BR *b)
     int c = b->d[b->pos++];
     if (c == 0xFF) {
         int c2 = (b->pos < b->len) ? b->d[b->pos] : 0xD9;
-        if (c2 == 0) { b->pos++; return 0xFF; }    /* stuffed byte */
-        b->pos--;                                  /* leave marker for caller */
+        if (c2 == 0) { b->pos++; return 0xFF; }
+        b->pos--;
         b->hit_marker = 1;
         return -1;
     }
@@ -57,7 +51,7 @@ static int getbit(BR *b)
 {
     if (b->bitcnt == 0) {
         int c = fill_byte(b);
-        if (c < 0) return 0;                        /* pad past marker */
+        if (c < 0) return 0;
         b->bitbuf = c; b->bitcnt = 8;
     }
     int bit = (b->bitbuf >> 7) & 1;
@@ -144,7 +138,7 @@ static void idct8x8(const int *in, uint8_t *out, int out_stride)
  * offset by (s-1)/2 luma pixels, matching libjpeg's smooth upsampling. */
 static int sample_comp(const uint8_t *plane, int pw, int ph, int sh, int sv, int x, int y)
 {
-    int fx = (2 * x - (sh - 1)) * 128 / sh;     /* chroma x * 256 */
+    int fx = (2 * x - (sh - 1)) * 128 / sh;
     int fy = (2 * y - (sv - 1)) * 128 / sv;
     if (fx < 0) fx = 0;
     if (fy < 0) fy = 0;
@@ -176,12 +170,12 @@ int jpeg_decode(const uint8_t *data, int len, Bitmap *out)
     int Hmax = 1, Vmax = 1;
 
     int p = 2;
-    /* parse headers up to SOS */
+
     while (p + 4 <= len) {
         if (data[p] != 0xFF) { p++; continue; }
         int marker = data[p + 1];
         p += 2;
-        if (marker == 0xD9) return -1;                 /* EOI before SOS */
+        if (marker == 0xD9) return -1;
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
         if (p + 2 > len) return -1;
         int seg = (data[p] << 8) | data[p + 1];
@@ -189,7 +183,7 @@ int jpeg_decode(const uint8_t *data, int len, Bitmap *out)
         int slen = seg - 2;
         if (p + seg > len) return -1;
 
-        if (marker == 0xDB) {                          /* DQT */
+        if (marker == 0xDB) {
             int q = 0;
             while (q < slen) {
                 int pq = sd[q] >> 4, tq = sd[q] & 15; q++;
@@ -199,7 +193,7 @@ int jpeg_decode(const uint8_t *data, int len, Bitmap *out)
                     else qt[tq][i] = sd[q++];
                 }
             }
-        } else if (marker == 0xC0) {                   /* SOF0 baseline */
+        } else if (marker == 0xC0) {
             int prec = sd[0]; (void)prec;
             height = (sd[1] << 8) | sd[2];
             width = (sd[3] << 8) | sd[4];
@@ -214,9 +208,9 @@ int jpeg_decode(const uint8_t *data, int len, Bitmap *out)
                 if (comp[c].h > Hmax) Hmax = comp[c].h;
                 if (comp[c].v > Vmax) Vmax = comp[c].v;
             }
-        } else if (marker == 0xC2) {                   /* progressive: unsupported */
+        } else if (marker == 0xC2) {
             return -1;
-        } else if (marker == 0xC4) {                   /* DHT */
+        } else if (marker == 0xC4) {
             int q = 0;
             while (q < slen) {
                 int tc = sd[q] >> 4, th = sd[q] & 15; q++;
@@ -228,16 +222,16 @@ int jpeg_decode(const uint8_t *data, int len, Bitmap *out)
                 if (tc) build_huff(&ac[th], counts, vals);
                 else build_huff(&dc[th], counts, vals);
             }
-        } else if (marker == 0xDD) {                   /* DRI */
+        } else if (marker == 0xDD) {
             restart = (sd[0] << 8) | sd[1];
-        } else if (marker == 0xDA) {                   /* SOS */
+        } else if (marker == 0xDA) {
             int ns = sd[0];
             for (int i = 0; i < ns; i++) {
                 int cid = sd[1 + i * 2];
                 int t = sd[2 + i * 2];
                 for (int c = 0; c < ncomp; c++) if (comp[c].id == cid) { comp[c].td = t >> 4; comp[c].ta = t & 15; }
             }
-            p += seg;                                  /* entropy data starts here */
+            p += seg;
             goto decode;
         }
         p += seg;
@@ -264,7 +258,7 @@ decode:
     for (int my = 0; my < mcuy; my++) {
         for (int mx = 0; mx < mcux; mx++) {
             if (restart && mcu_count > 0 && (mcu_count % restart) == 0) {
-                /* align + consume RSTn */
+
                 br.bitcnt = 0;
                 while (br.pos + 1 < br.len) {
                     if (br.d[br.pos] == 0xFF && br.d[br.pos + 1] >= 0xD0 && br.d[br.pos + 1] <= 0xD7) { br.pos += 2; break; }
@@ -307,7 +301,6 @@ decode:
         }
     }
 
-    /* assemble RGBA */
     out->pixels = (uint32_t *)kmalloc(width * height * 4);
     if (!out->pixels) { for (int c = 0; c < ncomp; c++) kfree(plane[c]); return -1; }
     out->width = width; out->height = height; out->stride = width; out->has_alpha = 0;

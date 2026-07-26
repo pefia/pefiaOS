@@ -1,12 +1,3 @@
-; boot/boot.asm
-;
-; Multiboot v1 entry stub. GRUB2 drops us here already in 32-bit protected
-; mode with paging off, so there's no real/protected mode transition to do
-; ourselves - just enough setup to call into C.
-;
-; We ask for a linear framebuffer through the Multiboot video fields (mode 0)
-; instead of relying on VGA text mode, since the desktop needs pixel access.
-
 MB_MAGIC    equ 0x1BADB002
 MB_ALIGN    equ 1 << 0
 MB_MEMINFO  equ 1 << 1
@@ -15,8 +6,8 @@ MB_FLAGS    equ MB_ALIGN | MB_MEMINFO | MB_VIDEO
 MB_CHECKSUM equ -(MB_MAGIC + MB_FLAGS)
 
 FB_MODE     equ 0      ; linear graphics framebuffer (1 would mean text mode)
-FB_WIDTH    equ 1024
-FB_HEIGHT   equ 768
+FB_WIDTH    equ 1920
+FB_HEIGHT   equ 1080
 FB_DEPTH    equ 32
 
 STACK_SIZE  equ 128 * 1024   ; DOOM's renderer + BSP walk recurse deep enough

@@ -1,7 +1,3 @@
-/* kernel/io.h
- * Wrappers around x86's IN/OUT instructions - everything that talks to a
- * hardware port (VGA cursor registers, PS/2 controller, PCI config space,
- * NIC registers) goes through here. */
 #ifndef PEFIA_IO_H
 #define PEFIA_IO_H
 
@@ -51,4 +47,4 @@ static inline void io_wait(void)
     __asm__ volatile ("outb %%al, $0x80" : : "a"(0));
 }
 
-#endif /* PEFIA_IO_H */
+#endif

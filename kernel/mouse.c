@@ -28,9 +28,10 @@ static const char *cursor_glyph[CURSOR_H] = {
 };
 
 static int cur_x, cur_y;
+static int wheel_accum;
 static unsigned button_mask;
 static int cursor_enabled = 0, cursor_visible = 0;
-static int save_x, save_y, save_w, save_h;   /* region we last drew over */
+static int save_x, save_y, save_w, save_h;
 static color_t saved_pixels[CURSOR_H * CURSOR_W];
 static color_t color_outline, color_fill;
 
@@ -97,3 +98,6 @@ void mouse_cursor_init(int x, int y)
 int mouse_x(void) { return cur_x; }
 int mouse_y(void) { return cur_y; }
 unsigned mouse_buttons(void) { return button_mask; }
+
+void mouse_add_wheel(int notches) { wheel_accum += notches; }
+int  mouse_take_wheel(void) { int n = wheel_accum; wheel_accum = 0; return n; }

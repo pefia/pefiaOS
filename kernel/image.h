@@ -1,10 +1,3 @@
-/* kernel/image.h
- *
- * One entry point for turning compressed image bytes into a Bitmap the
- * rest of the kernel can blit. Format is sniffed from the magic bytes,
- * not from a file extension or caller hint - useful since most callers
- * here got the data over HTTP with no filename attached.
- */
 #ifndef PEFIA_IMAGE_H
 #define PEFIA_IMAGE_H
 
@@ -18,4 +11,20 @@
  * on success, negative on any parse failure. */
 int img_decode(const uint8_t *data, int len, Bitmap *out);
 
-#endif /* PEFIA_IMAGE_H */
+/* Animation support. Only GIF can actually animate; every other format
+ * (and a single-frame GIF) just fills one frame so callers can treat all
+ * images uniformly. */
+#define ANIM_MAX_FRAMES 16
+typedef struct {
+    Bitmap frames[ANIM_MAX_FRAMES];   /* each independently kmalloc'd; free all via anim_free */
+    int    delays_ms[ANIM_MAX_FRAMES];
+    int    count;
+} AnimBitmap;
+
+/* Decodes any supported format. Non-GIF and single-frame GIF produce count==1
+ * with delays_ms[0]==0. Animated GIF: up to ANIM_MAX_FRAMES composited frames
+ * (later frames beyond the cap are ignored). Returns 0 on success. */
+int  img_decode_anim(const uint8_t *data, int len, AnimBitmap *out);
+void anim_free(AnimBitmap *a);
+
+#endif

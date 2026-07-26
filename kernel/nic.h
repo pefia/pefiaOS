@@ -1,8 +1,3 @@
-/* Generic NIC front end. Tries each network card driver pefiaOS knows
- * about (Intel e1000, since that's what VirtualBox emulates, then RTL8139
- * for QEMU) and, whichever wins, exposes one uniform send/poll/MAC
- * interface so the TCP/IP stack never has to care which one it's talking
- * to. */
 #ifndef PEFIA_NIC_H
 #define PEFIA_NIC_H
 
@@ -18,4 +13,4 @@ void            nic_set_rx_callback(nic_rx_cb_t cb);
 int             nic_send(const void *frame, uint16_t len);
 int             nic_poll(void);
 
-#endif /* PEFIA_NIC_H */
+#endif

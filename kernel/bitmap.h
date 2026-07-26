@@ -1,6 +1,3 @@
-/* Minimal BMP loader - just enough to decode the uncompressed 24/32-bit
- * files we actually ship as assets, plus a blitter that draws onto the
- * framebuffer with basic alpha keying. */
 #ifndef PEFIA_BITMAP_H
 #define PEFIA_BITMAP_H
 
@@ -12,11 +9,11 @@ typedef struct {
     int height;
     int stride;
     int has_alpha;
-    uint32_t *pixels; /* ARGB8888 */
+    uint32_t *pixels;
 } Bitmap;
 
 int  bmp_decode(const uint8_t *data, int len, Bitmap *out);
 void bmp_free(Bitmap *bmp);
 void bmp_blit(const Bitmap *bmp, int dst_x, int dst_y, int max_w, int max_h);
 
-#endif /* PEFIA_BITMAP_H */
+#endif

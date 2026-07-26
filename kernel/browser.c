@@ -4,10 +4,12 @@
 #include "heap.h"
 #include "net.h"
 #include "htmlrender.h"
+#include "clock.h"
 
-#define URL_CAP   256
-#define PAGE_CAP  196608
-#define HIST_CAP  16
+#define URL_CAP   512
+#define PAGE_CAP  786432   /* match htmlrender g_page - the render ceiling */
+#define BODY_CAP  1024
+#define HIST_CAP  32
 #define TOOLBAR_H 40
 #define STATUS_H  20
 #define SCROLLBAR 12
@@ -32,6 +34,8 @@ typedef struct BrowserState {
      * handling can hit-test against what was actually drawn */
     int      scr_x, scr_y, scr_w, scr_h;
 
+    unsigned last_anim_ms;
+
     int      page_len;
     char     page[PAGE_CAP];
 } BrowserState;
@@ -51,13 +55,6 @@ static int str_eq(const char *a, const char *b)
     int i = 0;
     while (a[i] && b[i]) { if (a[i] != b[i]) return 0; i++; }
     return a[i] == b[i];
-}
-
-static int str_starts(const char *s, const char *prefix)
-{
-    int i = 0;
-    while (prefix[i]) { if (s[i] != prefix[i]) return 0; i++; }
-    return 1;
 }
 
 static char to_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
@@ -81,12 +78,6 @@ static void sb_str(StrBuf *sb, const char *s)
     sb->buf[sb->len] = '\0';
 }
 
-static void sb_char(StrBuf *sb, char c)
-{
-    if (sb->len < sb->cap - 1) sb->buf[sb->len++] = c;
-    sb->buf[sb->len] = '\0';
-}
-
 static void sb_int(StrBuf *sb, int v)
 {
     char digits[12];
@@ -102,26 +93,47 @@ static void sb_int(StrBuf *sb, int v)
 }
 
 static const char *HOME_HTML =
-    "<html><head><title>pefiaOS Start</title></head><body>"
+    "<html><head><title>pefiaOS Start</title>"
+    "<style>"
+    " body { text-align:center; }"
+    " .search { margin-top:22px; margin-bottom:10px; }"
+    " .hint { color:#6a7383; }"
+    " .links { margin-top:14px; }"
+    " .links a { margin-top:4px; }"
+    " h1 { margin-top:26px; margin-bottom:2px; }"
+    " h2 { margin-top:20px; }"
+    "</style></head><body>"
     "<h1>pefiaOS Web</h1>"
-    "<p>A real TCP/IP + TLS 1.3 browser running on bare metal. Type a URL above "
-    "and press Enter. https:// is assumed if you omit the scheme.</p>"
+    "<p class='hint'>A TCP/IP + TLS 1.3 browser on bare metal.</p>"
+    "<form class='search' action='https://lite.duckduckgo.com/lite/'>"
+    "<input type='text' name='q' size='40' placeholder='Search DuckDuckGo...'> "
+    "<input type='submit' value='Search'>"
+    "</form>"
+    "<p class='hint'>Click the box and type, then press Enter. Or type any URL "
+    "in the address bar above &mdash; https:// is assumed.</p>"
     "<hr>"
-    "<h2>Milestone B test pages</h2>"
-    "<ul>"
-    "<li><a href='about:test-layout'>about:test-layout</a> &mdash; layout and links</li>"
-    "<li><a href='about:test-js'>about:test-js</a> &mdash; inline/external script degrade</li>"
-    "<li><a href='about:test-img'>about:test-img</a> &mdash; image pipeline + fallback</li>"
-    "<li><a href='about:test-engine'>about:test-engine</a> &mdash; DOM + CSS cascade + JavaScript</li>"
-    "</ul>"
-    "<h2>External</h2>"
-    "<ul>"
-    "<li><a href='https://example.com/'>example.com</a> &mdash; a tiny test page</li>"
-    "<li><a href='https://www.google.com/'>google.com</a> &mdash; compatibility stress page</li>"
-    "<li><a href='http://info.cern.ch/'>info.cern.ch</a> &mdash; the first website (plain HTTP)</li>"
-    "</ul>"
-    "<h2>Notes</h2>"
-    "<p>Google and other JS-heavy apps will not fully render yet. Use about:test-* pages to verify engine progress.</p>"
+    "<h2>Quick searches</h2>"
+    "<p class='links'>"
+    "<a href='https://lite.duckduckgo.com/lite/?q=bare+metal+os'>bare metal os</a> &middot; "
+    "<a href='https://lite.duckduckgo.com/lite/?q=osdev+wiki'>osdev wiki</a> &middot; "
+    "<a href='https://lite.duckduckgo.com/lite/?q=x86+protected+mode'>x86 protected mode</a> &middot; "
+    "<a href='https://lite.duckduckgo.com/lite/?q=news'>news</a>"
+    "</p>"
+    "<h2>Sites that render well here</h2>"
+    "<p class='links'>"
+    "<a href='https://lite.duckduckgo.com/lite/'>DuckDuckGo Lite</a> &middot; "
+    "<a href='https://example.com/'>example.com</a> &middot; "
+    "<a href='http://info.cern.ch/'>info.cern.ch</a> &middot; "
+    "<a href='https://en.wikipedia.org/wiki/Operating_system'>Wikipedia</a>"
+    "</p>"
+    "<h2>Engine test pages</h2>"
+    "<p class='links'>"
+    "<a href='about:test-layout'>layout</a> &middot; "
+    "<a href='about:test-engine'>DOM + CSS + JS</a> &middot; "
+    "<a href='about:test-forms'>form controls</a> &middot; "
+    "<a href='about:test-js'>events + timers</a> &middot; "
+    "<a href='about:test-img'>images + video</a>"
+    "</p>"
     "</body></html>";
 
 static const char *TEST_LAYOUT_HTML =
@@ -129,26 +141,74 @@ static const char *TEST_LAYOUT_HTML =
     "<h1>Layout Test</h1><p>This page verifies text flow, headings, links, and lists.</p>"
     "<h2>Links</h2><p><a href='about:test-js'>Go JS test</a> | <a href='about:test-img'>Go IMG test</a></p>"
     "<h2>List</h2><ul><li>one</li><li>two</li><li>three</li></ul>"
+    "<h2>Table</h2><table><tr><th>Name</th><th>Value</th></tr>"
+    "<tr><td>alpha</td><td>1</td></tr><tr><td>beta</td><td>2</td></tr></table>"
     "<hr><p>Done.</p></body></html>";
 
 static const char *TEST_JS_HTML =
-    "<html><head><title>about:test-js</title></head><body>"
-    "<h1>JS Degrade Test</h1>"
-    "<p>Inline script below should inject words via document.write degrade:</p>"
-    "<script>document.write('INLINE_OK');</script>"
-    "<p>External script test:</p>"
-    "<script src='https://example.com/'></script>"
-    "<p>If external script has no document.write literals, no extra output appears (expected).</p>"
+    "<html><head><title>about:test-js</title>"
+    "<style> .box { background:#eef3fb; padding:8px; margin-top:6px; border:1px solid #b9c6de; }"
+    " #tick { color:#0a7a0a; font-weight:bold; } button { font-weight:bold; }</style>"
+    "</head><body>"
+    "<h1>JavaScript Engine Test</h1>"
+    "<div class='box'><p>Arrays and objects: <span id='arr'>?</span></p>"
+    "<p>Closure counter: <span id='clo'>?</span></p>"
+    "<p>String methods: <span id='str'>?</span></p></div>"
+    "<div class='box'><p>Click the button; a handler updates this line:</p>"
+    "<p id='clicked'>(not clicked yet)</p>"
+    "<button id='btn'>Click me</button></div>"
+    "<div class='box'><p>setInterval tick (should count up): <span id='tick'>0</span></p></div>"
+    "<script>"
+    " var a = [3, 1, 2]; a.push(9);"
+    " document.getElementById('arr').textContent = 'len=' + a.length + ' join=' + a.join('-') + ' map=' + a.map(function(x){return x*2;}).join(',');"
+    " function counter() { var n = 0; return function () { n = n + 1; return n; }; }"
+    " var c = counter(); c(); c();"
+    " document.getElementById('clo').textContent = 'called 3x -> ' + c();"
+    " var s = 'Hello,World';"
+    " document.getElementById('str').textContent = s.split(',').join(' + ') + ' | upper=' + s.toUpperCase() + ' | has World=' + s.includes('World');"
+    " document.getElementById('btn').addEventListener('click', function () {"
+    "   document.getElementById('clicked').innerHTML = 'handler ran - DOM updated live';"
+    " });"
+    " var n = 0;"
+    " setInterval(function () { n = n + 1; document.getElementById('tick').textContent = n; }, 1000);"
+    "</script>"
+    "</body></html>";
+
+static const char *TEST_FORMS_HTML =
+    "<html><head><title>about:test-forms</title>"
+    "<style> fieldset { margin-top:8px; } label { color:#334; }</style></head><body>"
+    "<h1>Form Controls</h1>"
+    "<form action='https://duckduckgo.com/html/'>"
+    "<p>Text (GET to DuckDuckGo): <input type='text' name='q' size='28' placeholder='type a search...'>"
+    " <input type='submit' value='Search'></p>"
+    "</form>"
+    "<form action='https://httpbin.org/post' method='post'>"
+    "<p>POST form &mdash; every control below is serialized into the request body.</p>"
+    "<p>Name: <input type='text' name='name' value='pefia' size='16'></p>"
+    "<p>Password: <input type='password' name='pw' size='16' value='secret'></p>"
+    "<p>Subscribe: <input type='checkbox' name='sub' value='yes' checked> yes</p>"
+    "<p>Plan: <input type='radio' name='plan' value='free' checked> free "
+    "<input type='radio' name='plan' value='pro'> pro</p>"
+    "<p>Color: <select name='color'><option>red</option><option>green</option><option>blue</option></select> "
+    "(click to cycle)</p>"
+    "<input type='hidden' name='src' value='pefiaOS'>"
+    "<p><input type='submit' value='POST it'></p>"
+    "</form>"
+    "<p>Password text is masked, unchecked boxes are omitted, and the hidden "
+    "field rides along - the same rules a real browser follows.</p>"
     "</body></html>";
 
 static const char *TEST_IMG_HTML =
     "<html><head><title>about:test-img</title></head><body>"
-    "<h1>Image Test</h1>"
-    "<p>Image pipeline placeholder/metadata check:</p>"
-    "<img src='https://example.com/favicon.ico' alt='[img fallback alt]'>"
+    "<h1>Image + Media Test</h1>"
+    "<p>PNG over HTTPS:</p>"
+    "<img src='https://upload.wikimedia.org/wikipedia/commons/thumb/8/8b/Tux-G2.png/240px-Tux-G2.png' width='240' height='283' alt='[png over https]'>"
+    "<p>Animated GIF (every frame is decoded and played):</p>"
+    "<img src='https://upload.wikimedia.org/wikipedia/commons/2/2c/Rotating_earth_%28large%29.gif' alt='[animated gif]'>"
+    "<p>Video element (no codec - renders a clickable placeholder):</p>"
+    "<video src='https://example.com/movie.mp4' poster=''></video>"
     "<p>Relative image resolution test:</p>"
     "<img src='/favicon.ico' alt='[relative img alt]'>"
-    "<p>If decoded BMP is available you should see [img WxH] metadata now.</p>"
     "</body></html>";
 
 static const char *TEST_ENGINE_HTML =
@@ -156,18 +216,30 @@ static const char *TEST_ENGINE_HTML =
     "<style>"
     " body { color:#222; }"
     " h1 { color:#1a3c8c; text-align:center; }"
-    " .card { background:#eaf1fb; padding:8px; margin-top:8px; }"
+    " .card { background:#eaf1fb; padding:8px; margin-top:8px; border:1px solid #aac; }"
     " .ok { color:green; font-weight:bold; }"
     " .warn { color:#c04000; }"
     " #out { color:#0a8a0a; font-weight:bold; }"
+    " ul.tests > li { color:#333; }"
+    " ul.tests li:first-child { font-weight:bold; }"
+    " li[data-kind='attr'] { color:#8a0a8a; }"
+    " h2 + p { color:#555; text-transform:uppercase; }"
+    " @media print { body { color:#ff0000; } }"
     "</style></head><body>"
     "<h1>PefiaOS Engine Test</h1>"
-    "<img src='https://www.google.com/images/branding/googlelogo/1x/googlelogo_white_background_color_272x92dp.png' width='272' height='92' alt='Google logo'>"
     "<div class='card'>"
     "<p class='ok'>CSS cascade works if this line is green and bold.</p>"
     "<p class='warn'>This line should be orange.</p>"
     "<p style='color:purple'>Inline style sets this purple.</p>"
     "</div>"
+    "<h2>Selectors</h2>"
+    "<p>This line is uppercased by an adjacent-sibling rule (h2 + p).</p>"
+    "<ul class='tests'>"
+    "<li>child combinator + :first-child (bold)</li>"
+    "<li data-kind='attr'>attribute selector (purple)</li>"
+    "<li>plain item</li>"
+    "</ul>"
+    "<p>Print-only rules must NOT apply: this text stays dark, not red.</p>"
     "<h2>JavaScript + DOM</h2>"
     "<p>Loop result: <span id='out'>(script did not run)</span></p>"
     "<p>List built by innerHTML:</p><ul id='list'></ul>"
@@ -261,8 +333,9 @@ static int try_local_page(BrowserState *s, const char *url, int add_hist)
     struct { const char *name; const char *html; const char *status; } pages[] = {
         { "about:home",        HOME_HTML,        "Start page" },
         { "about:test-layout", TEST_LAYOUT_HTML, "Local test: layout" },
-        { "about:test-js",     TEST_JS_HTML,     "Local test: js degrade" },
-        { "about:test-img",    TEST_IMG_HTML,    "Local test: image pipeline" },
+        { "about:test-js",     TEST_JS_HTML,     "Local test: JS events, timers, arrays" },
+        { "about:test-img",    TEST_IMG_HTML,    "Local test: images, animation, media" },
+        { "about:test-forms",  TEST_FORMS_HTML,  "Local test: form controls, GET and POST" },
         { "about:test-engine", TEST_ENGINE_HTML, "Local test: DOM + CSS + JS engine" },
     };
     int is_home = str_eq(url, "") || str_eq(url, "home");
@@ -280,12 +353,14 @@ static int try_local_page(BrowserState *s, const char *url, int add_hist)
     return 0;
 }
 
-static void navigate(BrowserState *s, int add_hist)
+/* One fetch + render. `post_body` non-NULL means POST it (form submission);
+ * everything else about the two paths is identical. */
+static void navigate_body(BrowserState *s, int add_hist, const char *post_body)
 {
     char url[URL_CAP];
     str_copy(url, s->url, sizeof(url));
 
-    if (try_local_page(s, url, add_hist)) return;
+    if (!post_body && try_local_page(s, url, add_hist)) return;
 
     if (!str_starts_ci(url, "http://") && !str_starts_ci(url, "https://") && !str_starts_ci(url, "about:")) {
         char fixed[URL_CAP];
@@ -300,13 +375,19 @@ static void navigate(BrowserState *s, int add_hist)
     draw_loading_overlay(s);
 
     NetResponse resp;
-    int r = net_fetch(url, &resp);
+    int r = post_body ? net_fetch_post(url, post_body, &resp) : net_fetch(url, &resp);
 
     if (r == 0 && resp.body_len > 0) {
         const char *content_type = resp.content_type;
         int is_html = !content_type[0] ||
                       str_starts_ci(content_type, "text/html") ||
+                      str_starts_ci(content_type, "text/plain") ||
                       str_starts_ci(content_type, "application/xhtml+xml");
+
+        /* the URL has to be current before load_html, since the renderer
+         * resolves every relative resource against it */
+        str_copy(s->url, resp.final_url[0] ? resp.final_url : url, sizeof(s->url));
+        s->url_len = str_len(s->url);
 
         if (is_html) {
             load_html(s, resp.body, resp.body_len);
@@ -319,13 +400,10 @@ static void navigate(BrowserState *s, int add_hist)
             sb_str(&sb, resp.final_url[0] ? resp.final_url : url);
             sb_str(&sb, "</p><p>Content-Type: ");
             sb_str(&sb, content_type);
-            sb_str(&sb, "</p><p>This browser currently renders HTML text only. "
-                        "Images and scripts are fetched in compatibility/degrade mode.</p></body></html>");
+            sb_str(&sb, "</p><p>This browser renders HTML and plain text. Images load "
+                        "inside pages; other binary types are not decoded here.</p></body></html>");
             load_html(s, buf, sb.len);
         }
-
-        str_copy(s->url, resp.final_url[0] ? resp.final_url : url, sizeof(s->url));
-        s->url_len = str_len(s->url);
 
         char status_line[120];
         StrBuf sb;
@@ -340,6 +418,20 @@ static void navigate(BrowserState *s, int add_hist)
         str_copy(s->status, net_status_text(), sizeof(s->status));
     }
     if (add_hist) push_hist(s, s->url);
+}
+
+static void navigate(BrowserState *s, int add_hist) { navigate_body(s, add_hist, 0); }
+
+/* Submits the form owning `field` (field < 0 = the focused one). */
+static void submit_form(BrowserState *s, int field)
+{
+    char nav[URL_CAP], body[BODY_CAP];
+    int how = html_field_submit(field, nav, sizeof(nav), body, sizeof(body));
+    if (!how) return;
+    html_field_focus(-1);
+    str_copy(s->url, nav, sizeof(s->url));
+    s->url_len = str_len(s->url);
+    navigate_body(s, 1, how == 2 ? body : 0);
 }
 
 void *browser_new(void)
@@ -361,6 +453,7 @@ void *browser_new(void)
     s->scr_x = s->scr_y = 0;
     s->scr_w = 600;
     s->scr_h = 400;
+    s->last_anim_ms = 0;
     s->page_len = 0;
 
     load_html(s, HOME_HTML, str_len(HOME_HTML));
@@ -417,11 +510,11 @@ void browser_paint(Window *w, int x, int y, int wdt, int hgt)
     fb_fill_rect(addr_x + addr_w - 1, by, 1, bh, fb_rgb(170, 182, 206));
 
     int max_cols = (addr_w - 12) / 8;
-    char shown[128];
+    char shown[160];
     int url_len = s->url_len, from = 0;
     if (url_len > max_cols) from = url_len - max_cols;
     int shown_len = 0;
-    while (s->url[from + shown_len] && shown_len < 127) { shown[shown_len] = s->url[from + shown_len]; shown_len++; }
+    while (s->url[from + shown_len] && shown_len < 159) { shown[shown_len] = s->url[from + shown_len]; shown_len++; }
     shown[shown_len] = '\0';
     gfx_text(addr_x + 6, by + 3, shown, fb_rgb(28, 34, 48), addr_bg);
     if (s->address_focused) {
@@ -465,9 +558,9 @@ void browser_paint(Window *w, int x, int y, int wdt, int hgt)
     fb_fill_rect(x, status_y, wdt, STATUS_H, fb_rgb(228, 233, 242));
     fb_fill_rect(x, status_y, wdt, 1, fb_rgb(196, 206, 222));
     int status_cols = (wdt - 16) / 8;
-    char status_line[160];
+    char status_line[200];
     int q = 0;
-    while (s->status[q] && q < status_cols && q < 159) { status_line[q] = s->status[q]; q++; }
+    while (s->status[q] && q < status_cols && q < 199) { status_line[q] = s->status[q]; q++; }
     status_line[q] = '\0';
     gfx_text(x + 8, status_y + 2, status_line, fb_rgb(60, 72, 96), fb_rgb(228, 233, 242));
 }
@@ -477,12 +570,30 @@ void browser_key(Window *w, char c)
     BrowserState *s = (BrowserState *)w->state;
     if (!s) return;
 
+    /* A focused in-page text field eats keys before scroll/address handling.
+     * Enter submits the enclosing form. */
+    if (!s->address_focused && html_field_focused() >= 0) {
+        if (c == '\n' || c == '\r') { submit_form(s, -1); return; }
+        html_field_key(c);
+        return;
+    }
+
     if (!s->address_focused) {
         int content_h = s->scr_h - TOOLBAR_H - STATUS_H;
         if (c == ' ')      s->scroll += content_h * 4 / 5;
         else if (c == 'b') s->scroll -= content_h * 4 / 5;
         else if (c == 'j') s->scroll += 40;
         else if (c == 'k') s->scroll -= 40;
+        else if (c == 'g') s->scroll = 0;
+        else if (c == 'G') s->scroll = s->doc_h;
+        else if (c == '\b') {
+            if (s->hist_pos > 0) {
+                s->hist_pos--;
+                str_copy(s->url, s->hist[s->hist_pos], URL_CAP);
+                s->url_len = str_len(s->url);
+                navigate(s, 0);
+            }
+        }
         if (s->scroll < 0) s->scroll = 0;
         return;
     }
@@ -498,53 +609,59 @@ void browser_key(Window *w, char c)
     }
 }
 
-void browser_tick(Window *w)
+/* Mouse wheel: positive notches scroll down, three text lines per notch.
+ * Clamped like browser_key - low end here, high end in browser_paint. */
+void browser_scroll(Window *w, int notches)
 {
     BrowserState *s = (BrowserState *)w->state;
     if (!s) return;
-    html_set_base_url(s->url);
-    html_set_page(s, s->gen, s->page, s->page_len);
+    s->scroll += notches * 3 * 16;
+    if (s->scroll < 0) s->scroll = 0;
 }
 
-/* Resolves a clicked href against the current URL: absolute links pass
- * through, "/path" links keep the current scheme+host, "#frag" is ignored
- * (no in-page anchor support), and anything else is relative to the current
- * URL's directory. */
-static void resolve_click_target(BrowserState *s, const char *href, char *nav, int cap)
+/* Runs once per frame per visible browser window: keeps the renderer pointed
+ * at this window's page, then lets the script engine run its timers and
+ * pending load handlers and acts on whatever they asked for. Returns 1 when
+ * something changed on screen, because the frame loop otherwise only
+ * repaints in response to input - a setInterval counter or an animated GIF
+ * would update the DOM and never be seen. */
+int browser_tick(Window *w)
 {
-    if (str_starts_ci(href, "http://") || str_starts_ci(href, "https://")) {
-        str_copy(nav, href, cap);
-        return;
+    BrowserState *s = (BrowserState *)w->state;
+    if (!s) return 0;
+    html_set_base_url(s->url);
+    html_set_page(s, s->gen, s->page, s->page_len);
+
+    int repaint = html_pump();
+
+    /* An animation has no DOM change to report, so pace it here instead of
+     * repainting the whole desktop as fast as the loop spins. */
+    if (html_animating()) {
+        unsigned now = clock_ms();
+        if ((unsigned)(now - s->last_anim_ms) >= 40) { s->last_anim_ms = now; repaint = 1; }
     }
 
-    if (href[0] == '/') {
-        char base[URL_CAP];
-        str_copy(base, s->url, sizeof(base));
-        int scheme_len = str_starts_ci(base, "http://") ? 7 : str_starts_ci(base, "https://") ? 8 : 0;
-
-        if (scheme_len == 0) { str_copy(nav, href, cap); return; }
-
-        int host_end = scheme_len;
-        while (base[host_end] && base[host_end] != '/') host_end++;
-
+    char msg[200];
+    if (html_take_alert(msg, sizeof(msg))) {
+        char line[200];
         StrBuf sb;
-        sb_init(&sb, nav, cap);
-        for (int i = 0; i < host_end; i++) sb_char(&sb, base[i]);
-        sb_str(&sb, href);
-        return;
+        sb_init(&sb, line, sizeof(line));
+        sb_str(&sb, "alert: ");
+        sb_str(&sb, msg);
+        str_copy(s->status, line, sizeof(s->status));
+        repaint = 1;
     }
 
-    char base[URL_CAP];
-    str_copy(base, s->url, sizeof(base));
-    int cut = str_len(base);
-    while (cut > 0 && base[cut - 1] != '/') cut--;
-    if (cut < 8) cut = str_len(base);   /* no path slash at all; just append */
+    char nav[URL_CAP];
+    if (html_take_nav(nav, sizeof(nav)) && nav[0]) {
+        str_copy(s->url, nav, sizeof(s->url));
+        s->url_len = str_len(s->url);
+        navigate(s, 1);
+        repaint = 1;
+    }
 
-    StrBuf sb;
-    sb_init(&sb, nav, cap);
-    for (int i = 0; i < cut; i++) sb_char(&sb, base[i]);
-    if (sb.len == 0 || sb.buf[sb.len - 1] != '/') sb_str(&sb, "/");
-    sb_str(&sb, href);
+    s->doc_h = html_doc_height();
+    return repaint;
 }
 
 void browser_click(Window *w, int relx, int rely)
@@ -580,7 +697,7 @@ void browser_click(Window *w, int relx, int rely)
         if (relx >= wdt - go_w - 8 && relx < wdt - 8) { s->address_focused = 0; navigate(s, 1); return; }
 
         int addr_x = 100, addr_w = wdt - 100 - go_w - 16;
-        if (relx >= addr_x && relx < addr_x + addr_w) { s->address_focused = 1; s->caret_tick = 0; return; }
+        if (relx >= addr_x && relx < addr_x + addr_w) { s->address_focused = 1; s->caret_tick = 0; html_field_focus(-1); return; }
     }
 
     int content_y = TOOLBAR_H;
@@ -602,13 +719,41 @@ void browser_click(Window *w, int relx, int rely)
         s->address_focused = 0;
         int doc_x = relx;
         int doc_y = (rely - content_y) + s->scroll;
+
+        /* form controls take precedence over links at the same spot */
+        int fid = html_field_at(doc_x, doc_y);
+        if (fid >= 0) {
+            switch (html_field_kind(fid)) {
+                case FK_SUBMIT: submit_form(s, fid); return;
+                case FK_TEXT:   html_field_focus(fid); return;
+                case FK_CHECK:
+                case FK_SELECT: html_field_focus(-1); html_field_toggle(fid); return;
+                default:        html_field_focus(-1); return;
+            }
+        }
+        html_field_focus(-1);
+
+        /* a script click handler gets the click before link navigation, the
+         * same order a real browser uses (a handler may replace the page) */
+        if (html_click_script(doc_x, doc_y)) {
+            char nav_js[URL_CAP];
+            if (html_take_nav(nav_js, sizeof(nav_js)) && nav_js[0]) {
+                str_copy(s->url, nav_js, sizeof(s->url));
+                s->url_len = str_len(s->url);
+                navigate(s, 1);
+            }
+            return;
+        }
+
+        /* Hrefs arrive already resolved against the base URL - the renderer
+         * does that at layout time, and resolving a second time here is how
+         * "about:test-engine" used to turn into "about:home/about:test-engine". */
         const char *href = html_link_at(doc_x, doc_y);
         if (href && href[0]) {
             if (href[0] == '#') return;   /* in-page anchor: no target to jump to */
+            if (str_starts_ci(href, "javascript:")) return;
 
-            char nav[URL_CAP];
-            resolve_click_target(s, href, nav, sizeof(nav));
-            str_copy(s->url, nav, sizeof(s->url));
+            str_copy(s->url, href, sizeof(s->url));
             s->url_len = str_len(s->url);
             navigate(s, 1);
         }
@@ -616,4 +761,5 @@ void browser_click(Window *w, int relx, int rely)
     }
 
     s->address_focused = 0;
+    html_field_focus(-1);
 }

@@ -1,12 +1,3 @@
-/* kernel/wm.c
- * Window manager + compositor. Windows live in z-order inside wins[], with
- * the last entry always on top. Each frame: paint the desktop gradient,
- * every window back-to-front with a drop shadow, then the taskbar over all
- * of it. Input is polled, never blocking - the taskbar gets first look at
- * clicks (and at keys while its menu is open), otherwise keys go to whatever
- * window is on top and clicks raise/drag/resize/close or fall through to the
- * app underneath.
- */
 #include "wm.h"
 #include "framebuffer.h"
 #include "console.h"
@@ -20,6 +11,11 @@
 #include "browser.h"
 #include "games.h"
 #include "doom_app.h"
+#include "interp.h"
+#include "settings.h"
+#include "theme.h"
+#include "sched.h"
+#include "vfs.h"
 
 #include <stddef.h>
 
@@ -29,9 +25,11 @@
 #define GLYPH_W     8
 #define GLYPH_H     16
 #define PAD         10
-#define GRIP        16    /* bottom-right resize handle, in pixels */
+#define GRIP        16
 #define MIN_W       200   /* a window can't be resized smaller than this */
 #define MIN_H       150
+#define TASKBAR_H   140   /* reserved strip at the bottom (matches draw_desktop) */
+#define SNAP_EDGE   6     /* cursor within this many px of a screen edge snaps */
 
 static Window *wins[MAX_WINDOWS];
 static int win_count;
@@ -66,6 +64,7 @@ static Window *alloc_window(int x, int y, int w, int h, const char *title)
     if (!win) return NULL;
     win->x = x; win->y = y; win->w = w; win->h = h;
     win->visible = 1;
+    win->snapped = 0;
     win->cwd = 0; win->sel = -1;
     win->state = NULL;
     win->body[0] = '\0';
@@ -111,6 +110,16 @@ Window *wm_create_notepad(int x, int y, int w, int h)
     return win;
 }
 
+Window *wm_create_editor(int x, int y, int w, int h, int dir, int node)
+{
+    const VNode *v = vfs_node(node);
+    Window *win = alloc_window(x, y, w, h, v ? v->name : "Notepad");
+    if (!win) return NULL;
+    win->kind = WIN_NOTEPAD;
+    win->state = notepad_open(dir, node);
+    return win;
+}
+
 Window *wm_create_browser(int x, int y, int w, int h)
 {
     Window *win = alloc_window(x, y, w, h, "Browser");
@@ -135,6 +144,23 @@ Window *wm_create_doom(int x, int y, int w, int h)
     if (!win) return NULL;
     win->kind = WIN_DOOM;
     win->state = doom_app_new();
+    return win;
+}
+
+Window *wm_create_interp(int lang, int x, int y, int w, int h)
+{
+    Window *win = alloc_window(x, y, w, h, lang == INTERP_PY ? "Python" : "C Interpreter");
+    if (!win) return NULL;
+    win->kind = WIN_INTERP;
+    win->state = interp_new(lang);
+    return win;
+}
+
+Window *wm_create_settings(int x, int y, int w, int h)
+{
+    Window *win = alloc_window(x, y, w, h, "Settings");
+    if (!win) return NULL;
+    win->kind = WIN_SETTINGS;
     return win;
 }
 
@@ -185,8 +211,14 @@ static void draw_window(Window *w, int focused)
     fb_fill_rect(w->x + 6, w->y + 6, w->w + 8, w->h + 8, col_shadow);
     fb_fill_rect(w->x + 3, w->y + 3, w->w + 4, w->h + 4, fb_rgb(35, 46, 66));
 
-    color_t title_bg  = focused ? col_title : col_title_dim;
-    color_t title_top = focused ? fb_rgb(53, 118, 228) : fb_rgb(102, 114, 144);
+    uint8_t ar, ag, ab; theme_accent_rgb(&ar, &ag, &ab);
+    color_t accent    = fb_rgb(ar, ag, ab);
+    color_t accent_lt = fb_rgb((uint8_t)(ar + (255 - ar) / 4),
+                               (uint8_t)(ag + (255 - ag) / 4),
+                               (uint8_t)(ab + (255 - ab) / 4));
+    color_t title_bg  = focused ? accent    : col_title_dim;
+    color_t title_top = focused ? accent_lt : fb_rgb(102, 114, 144);
+    (void)col_title;
 
     fb_fill_rect(w->x - 1, w->y - 1, w->w + 2, w->h + 2, col_border);
     fb_fill_rect(w->x, w->y, w->w, TITLE_H / 2, title_top);
@@ -208,6 +240,8 @@ static void draw_window(Window *w, int focused)
     case WIN_BROWSER:  browser_paint(w, w->x, body_y, body_w, body_h); break;
     case WIN_GAME:     game_paint(w, w->x, body_y, body_w, body_h); break;
     case WIN_DOOM:     doom_app_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_INTERP:   interp_paint(w, w->x, body_y, body_w, body_h); break;
+    case WIN_SETTINGS: settings_paint(w, w->x, body_y, body_w, body_h); break;
     default:
         fb_fill_rect(w->x, body_y, body_w, body_h, col_content);
         draw_info_body(w);
@@ -224,21 +258,32 @@ static void draw_window(Window *w, int focused)
 static void draw_desktop(void)
 {
     int w = fb_width(), h = fb_height();
+    uint8_t ar, ag, ab; theme_accent_rgb(&ar, &ag, &ab);
+    int dark = theme_dark();
+
+    /* Fade a near-black (dark) or near-white (light) top into a dim tint of
+     * the accent at the bottom, so the whole desktop follows the theme. */
+    int top_r = dark ? 8  : 232, top_g = dark ? 12 : 236, top_b = dark ? 22 : 244;
+    int bot_r = dark ? ar / 3 : 160 + ar / 4;
+    int bot_g = dark ? ag / 3 : 160 + ag / 4;
+    int bot_b = dark ? ab / 3 : 160 + ab / 4;
+
     int bands = 64, band_h = (h + bands - 1) / bands;
     for (int i = 0; i < bands; i++) {
         int t = (i * 255) / bands;
-        uint8_t r = (uint8_t)(10 + (t * 16) / 255);
-        uint8_t g = (uint8_t)(26 + (t * 58) / 255);
-        uint8_t b = (uint8_t)(54 + (t * 130) / 255);
+        uint8_t r = (uint8_t)(top_r + (bot_r - top_r) * t / 255);
+        uint8_t g = (uint8_t)(top_g + (bot_g - top_g) * t / 255);
+        uint8_t b = (uint8_t)(top_b + (bot_b - top_b) * t / 255);
         fb_fill_rect(0, i * band_h, w, band_h, fb_rgb(r, g, b));
     }
 
-    fb_fill_rect(0, h - 140, w, 140, fb_rgb(18, 58, 132));
-    fb_fill_rect(0, h - 139, w, 1, fb_rgb(74, 126, 218));
+    fb_fill_rect(0, h - 140, w, 140, fb_rgb((uint8_t)(ar / 3 + 6), (uint8_t)(ag / 3 + 8), (uint8_t)(ab / 3 + 12)));
+    fb_fill_rect(0, h - 139, w, 1, fb_rgb(ar, ag, ab));
 }
 
 static void wm_paint(void)
 {
+    fb_begin_offscreen();
     mouse_hide();
     draw_desktop();
     for (int i = 0; i < win_count; i++)
@@ -246,6 +291,7 @@ static void wm_paint(void)
             draw_window(wins[i], i == win_count - 1);
     taskbar_paint();
     mouse_show();
+    fb_end_offscreen();
 }
 
 static void raise_to_top(int i)
@@ -258,7 +304,7 @@ static void raise_to_top(int i)
 static void close_index(int i)
 {
     switch (wins[i]->kind) {
-    case WIN_GAME: game_free(wins[i]->state); break;      /* also frees its offscreen buffer */
+    case WIN_GAME: game_free(wins[i]->state); break;
     case WIN_DOOM: doom_app_free(wins[i]->state); break;
     default:
         if (wins[i]->state) kfree(wins[i]->state);
@@ -275,6 +321,32 @@ static int point_in_window(Window *w, int px, int py)
            py >= w->y - 1 && py < w->y + w->h + 1;
 }
 
+/* Set a window's rect and tell size-sensitive apps (game/doom own a buffer). */
+static void set_geometry(Window *w, int x, int y, int ww, int hh)
+{
+    w->x = x; w->y = y; w->w = ww; w->h = hh;
+    if (w->kind == WIN_GAME)      game_resize(w, w->w, w->h - TITLE_H);
+    else if (w->kind == WIN_DOOM) doom_app_resize(w, w->w, w->h - TITLE_H);
+}
+
+/* Edge-tile the top window based on where the drag was released. Saves the
+ * pre-snap rect the first time so a later drag can restore it. */
+static void snap_to_edge(Window *w, int mx, int my)
+{
+    int fw = fb_width(), work_h = fb_height() - TASKBAR_H;
+    int snap;
+    if (my <= SNAP_EDGE)            snap = 1;
+    else if (mx <= SNAP_EDGE)       snap = 2;
+    else if (mx >= fw - SNAP_EDGE)  snap = 3;
+    else return;
+
+    if (!w->snapped) { w->sx = w->x; w->sy = w->y; w->sw = w->w; w->sh = w->h; }
+    w->snapped = 1;
+    if (snap == 1)      set_geometry(w, 0,      0, fw,        work_h);
+    else if (snap == 2) set_geometry(w, 0,      0, fw / 2,    work_h);
+    else                set_geometry(w, fw / 2, 0, fw - fw/2, work_h);
+}
+
 int         wm_count(void)  { return win_count; }
 const char *wm_title(int i) { return (i >= 0 && i < win_count) ? wins[i]->title : ""; }
 void        wm_raise(int i) { if (i >= 0 && i < win_count) raise_to_top(i); }
@@ -288,10 +360,17 @@ void wm_run(void)
     wm_paint();
 
     for (;;) {
+        sched_yield();   /* let cooperative kernel threads (e.g. worker) run a slice */
+
+        /* A page whose script timer fired (or whose animated GIF advanced a
+         * frame) has nothing to generate an input event, so the pump reports
+         * when it changed something and we repaint on its behalf. */
+        int pumped = 0;
         for (int i = 0; i < win_count; i++) {
             if (wins[i] && wins[i]->visible && wins[i]->kind == WIN_BROWSER)
-                browser_tick(wins[i]);
+                pumped |= browser_tick(wins[i]);
         }
+        if (pumped) wm_paint();
 
         /* Only the topmost window gets a tick - games and DOOM pace their own
          * animation, and there's no point advancing a game hidden behind
@@ -312,6 +391,19 @@ void wm_run(void)
         int left_down = (buttons & 1) && !(prev_buttons & 1);
         int left_up   = !(buttons & 1) && (prev_buttons & 1);
 
+        /* Wheel goes to the topmost window under the cursor - the same
+         * hit-test clicks use - but without raising it. Only the browser
+         * has anything to scroll today. */
+        int wheel = mouse_take_wheel();
+        if (wheel) {
+            for (int i = win_count - 1; i >= 0; i--) {
+                Window *w = wins[i];
+                if (!w->visible || !point_in_window(w, mx, my)) continue;
+                if (w->kind == WIN_BROWSER) { browser_scroll(w, wheel); wm_paint(); }
+                break;
+            }
+        }
+
         if (key) {
             if (taskbar_menu_open()) {
                 taskbar_key((char)key);
@@ -321,8 +413,9 @@ void wm_run(void)
                 switch (focused->kind) {
                 case WIN_TERMINAL: terminal_key(focused, (char)key); wm_paint(); break;
                 case WIN_NOTEPAD:  notepad_key(focused, (char)key);  wm_paint(); break;
+                case WIN_INTERP:   interp_key(focused, (char)key);   wm_paint(); break;
                 case WIN_BROWSER:  browser_key(focused, (char)key);  wm_paint(); break;
-                case WIN_GAME:     game_key(focused, (char)key); break;   /* next tick repaints */
+                case WIN_GAME:     game_key(focused, (char)key); break;
                 default: break;
                 }
             }
@@ -350,6 +443,12 @@ void wm_run(void)
                     } else if (on_grip) {
                         resizing = 1;
                     } else if (on_title) {
+                        if (top->snapped) {          /* pop back to pre-snap size under the cursor */
+                            set_geometry(top, mx - top->sw / 2, my - TITLE_H / 2, top->sw, top->sh);
+                            if (top->x < 0) top->x = 0;
+                            if (top->y < 0) top->y = 0;
+                            top->snapped = 0;
+                        }
                         dragging = 1;
                         drag_dx = mx - top->x;
                         drag_dy = my - top->y;
@@ -357,6 +456,8 @@ void wm_run(void)
                         explorer_click(top, mx - top->x, my - (top->y + TITLE_H));
                     } else if (top->kind == WIN_BROWSER) {
                         browser_click(top, mx - top->x, my - (top->y + TITLE_H));
+                    } else if (top->kind == WIN_SETTINGS) {
+                        settings_click(top, mx - top->x, my - (top->y + TITLE_H));
                     }
                     wm_paint();
                     break;
@@ -382,13 +483,15 @@ void wm_run(void)
             if (new_h < MIN_H) new_h = MIN_H;
             if (w->x + new_w > fb_width())  new_w = fb_width()  - w->x;
             if (w->y + new_h > fb_height()) new_h = fb_height() - w->y;
-            w->w = new_w; w->h = new_h;
-            if (w->kind == WIN_GAME)      game_resize(w, w->w, w->h - TITLE_H);
-            else if (w->kind == WIN_DOOM) doom_app_resize(w, w->w, w->h - TITLE_H);
+            w->snapped = 0;
+            set_geometry(w, w->x, w->y, new_w, new_h);
             wm_paint();
         }
 
-        if (left_up) { dragging = 0; resizing = 0; }
+        if (left_up) {
+            if (dragging && win_count > 0) { snap_to_edge(wins[win_count - 1], mx, my); wm_paint(); }
+            dragging = 0; resizing = 0;
+        }
 
         prev_buttons = buttons; prev_mx = mx; prev_my = my;
     }

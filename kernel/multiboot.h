@@ -1,23 +1,19 @@
-/* kernel/multiboot.h
- * Just the slice of the Multiboot v1 info struct we actually read: framebuffer
- * location and basic memory sizes. Field order below must track the spec
- * exactly - this is laid directly over what GRUB hands us in memory. */
 #ifndef PEFIA_MULTIBOOT_H
 #define PEFIA_MULTIBOOT_H
 
 #include <stdint.h>
 
-#define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002u  /* GRUB passes this in EAX */
-#define MULTIBOOT_INFO_MEMORY      0x00000001u  /* flags bit 0: mem_* valid */
-#define MULTIBOOT_INFO_MMAP        0x00000040u  /* flags bit 6: mmap_* valid */
-#define MULTIBOOT_INFO_FRAMEBUFFER 0x00001000u  /* flags bit 12: fb_* valid */
+#define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002u
+#define MULTIBOOT_INFO_MEMORY      0x00000001u
+#define MULTIBOOT_INFO_MMAP        0x00000040u
+#define MULTIBOOT_INFO_FRAMEBUFFER 0x00001000u
 
-#define MULTIBOOT_MEMORY_AVAILABLE 1            /* mmap entry type: usable RAM */
+#define MULTIBOOT_MEMORY_AVAILABLE 1
 
 struct multiboot_info {
     uint32_t flags;
-    uint32_t mem_lower;          /* KB below 1 MiB */
-    uint32_t mem_upper;          /* KB above 1 MiB */
+    uint32_t mem_lower;
+    uint32_t mem_upper;
     uint32_t boot_device;
     uint32_t cmdline;
     uint32_t mods_count;
@@ -37,11 +33,11 @@ struct multiboot_info {
     uint16_t vbe_interface_off;
     uint16_t vbe_interface_len;
     uint64_t framebuffer_addr;
-    uint32_t framebuffer_pitch;  /* bytes per scanline */
+    uint32_t framebuffer_pitch;
     uint32_t framebuffer_width;
     uint32_t framebuffer_height;
     uint8_t  framebuffer_bpp;
-    uint8_t  framebuffer_type;   /* 1 = direct RGB */
+    uint8_t  framebuffer_type;
     /* For type 1: red_pos, red_size, green_pos, green_size, blue_pos, blue_size */
     uint8_t  color_info[6];
 } __attribute__((packed));
@@ -53,7 +49,7 @@ struct multiboot_mmap_entry {
     uint32_t size;
     uint64_t addr;
     uint64_t len;
-    uint32_t type;       /* 1 = available */
+    uint32_t type;
 } __attribute__((packed));
 
-#endif /* PEFIA_MULTIBOOT_H */
+#endif

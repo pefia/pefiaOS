@@ -5,19 +5,17 @@
 #include "util.h"
 
 static int origin_x, origin_y;   /* pixel origin of the console region */
-static int col_count, row_count; /* size in character cells */
-static int cursor_x, cursor_y;   /* cursor position in cells */
+static int col_count, row_count;
+static int cursor_x, cursor_y;
 static color_t ink, paper;
 
 static void draw_glyph(int px, int py, unsigned char ch, color_t f, color_t b)
 {
-    const unsigned char *rows = font8x16[ch & 0x7F];
-    for (int row = 0; row < FONT_HEIGHT; row++) {
-        unsigned char bits = rows[row];
+    const unsigned char *cov = font8x16aa[ch & 0x7F];
+    for (int row = 0; row < FONT_HEIGHT; row++)
         for (int col = 0; col < FONT_WIDTH; col++)
             fb_put_pixel(px + col, py + row,
-                         (bits & (0x80 >> col)) ? f : b);
-    }
+                         fb_mix(b, f, cov[row * FONT_WIDTH + col]));
 }
 
 void gfx_text(int x, int y, const char *s, color_t f, color_t b)

@@ -1,6 +1,3 @@
-/* kernel/util.h
- * The handful of libc functions we'd otherwise be missing, kept header-only
- * since there's no libc to link against out here. */
 #ifndef PEFIA_UTIL_H
 #define PEFIA_UTIL_H
 
@@ -62,4 +59,4 @@ static inline char *kutoa(uint32_t v, char *buf)
     return buf;
 }
 
-#endif /* PEFIA_UTIL_H */
+#endif

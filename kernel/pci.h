@@ -1,5 +1,3 @@
-/* PCI config-space access via the legacy 0xCF8/0xCFC I/O ports (mechanism
- * #1). Good enough for the bus scan we need to find the NIC. */
 #ifndef PEFIA_PCI_H
 #define PEFIA_PCI_H
 

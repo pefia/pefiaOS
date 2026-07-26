@@ -1,11 +1,3 @@
-/* kernel/inflate.h
- *
- * DEFLATE (RFC 1951) decompressor plus the two container formats that
- * wrap it in practice: zlib (RFC 1950) and gzip (RFC 1952). PNG uses
- * zlib framing; HTTP responses tend to show up as either raw deflate
- * or gzip, hence auto_inflate() below for callers that don't want to
- * care which.
- */
 #ifndef PEFIA_INFLATE_H
 #define PEFIA_INFLATE_H
 
@@ -24,4 +16,4 @@ int gzip_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap);
  * 31) and dispatches accordingly. Falls back to raw deflate. */
 int auto_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap);
 
-#endif /* PEFIA_INFLATE_H */
+#endif

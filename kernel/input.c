@@ -9,6 +9,7 @@
 
 #define SC_LSHIFT 0x2A
 #define SC_RSHIFT 0x36
+#define SC_CTRL   0x1D   /* right Ctrl is the same code behind an 0xE0 prefix */
 
 /* US QWERTY, scan code set 1. 0 means "no printable character". */
 static const char keymap[128] = {
@@ -29,8 +30,6 @@ static const char keymap_shift[128] = {
     'M', '<', '>', '?', 0,   '*', 0,   ' ', 0,   0,
 };
 
-/* --- talking to the 8042 controller --- */
-
 static void ps2_wait_input_clear(void)  { int t = 100000; while ((inb(PS2_STAT) & 2) && t--) { } }
 static void ps2_wait_output_ready(void) { int t = 100000; while (!(inb(PS2_STAT) & 1) && t--) { } }
 
@@ -38,24 +37,39 @@ static void mouse_command(uint8_t cmd)
 {
     ps2_wait_input_clear(); outb(PS2_STAT, 0xD4);   /* next byte goes to the mouse */
     ps2_wait_input_clear(); outb(PS2_DATA, cmd);
-    ps2_wait_output_ready(); (void)inb(PS2_DATA);    /* eat the 0xFA ack */
+    ps2_wait_output_ready(); (void)inb(PS2_DATA);
 }
+
+/* 1 when the mouse answered the IntelliMouse knock and sends 4-byte packets
+ * with a wheel delta in the extra byte. */
+static int mouse_has_wheel;
 
 void input_init(void)
 {
-    while (inb(PS2_STAT) & 1) (void)inb(PS2_DATA);   /* flush anything stale */
+    while (inb(PS2_STAT) & 1) (void)inb(PS2_DATA);
 
-    ps2_wait_input_clear(); outb(PS2_STAT, 0xA8);   /* enable the aux (mouse) port */
+    ps2_wait_input_clear(); outb(PS2_STAT, 0xA8);
 
-    ps2_wait_input_clear(); outb(PS2_STAT, 0x20);   /* read controller config byte */
+    ps2_wait_input_clear(); outb(PS2_STAT, 0x20);
     ps2_wait_output_ready(); uint8_t cfg = inb(PS2_DATA);
     cfg |=  0x02;                      /* enable IRQ12 - harmless while we're polling anyway */
-    cfg &= ~0x20;                      /* clear the mouse-clock-disabled bit */
-    ps2_wait_input_clear(); outb(PS2_STAT, 0x60);   /* write it back */
+    cfg &= ~0x20;
+    ps2_wait_input_clear(); outb(PS2_STAT, 0x60);
     ps2_wait_input_clear(); outb(PS2_DATA, cfg);
 
-    mouse_command(0xF6);              /* reset to defaults */
-    mouse_command(0xF4);              /* turn on data reporting */
+    mouse_command(0xF6);
+
+    /* IntelliMouse knock: setting sample rates 200, 100, 80 in that order
+     * asks the mouse to switch to the 4-byte wheel protocol. A device that
+     * did reports ID 3 afterwards; anything else stays plain 3-byte PS/2. */
+    mouse_command(0xF3); mouse_command(200);
+    mouse_command(0xF3); mouse_command(100);
+    mouse_command(0xF3); mouse_command(80);
+    mouse_command(0xF2);              /* identify (the ack was eaten above)  */
+    ps2_wait_output_ready();
+    mouse_has_wheel = (inb(PS2_DATA) == 3);
+
+    mouse_command(0xF4);
 }
 
 /* --- held-key state for games; see input.h --- */
@@ -106,7 +120,7 @@ static int     evq_head, evq_tail;
 static void evq_push(uint8_t code, uint8_t pressed, uint8_t ext)
 {
     int next = (evq_head + 1) % EVQ_SIZE;
-    if (next == evq_tail) return;   /* queue's full, just drop it */
+    if (next == evq_tail) return;
     evq_code[evq_head]  = code;
     evq_press[evq_head] = pressed;
     evq_ext[evq_head]   = ext;
@@ -126,6 +140,7 @@ int input_next_event(int *scancode, int *pressed, int *ext)
 static int handle_key(uint8_t sc)
 {
     static int shift_held = 0;
+    static int ctrl_held = 0;
     static int pending_ext = 0;
 
     if (sc == 0xE0) { pending_ext = 1; return 0; }   /* prefix byte, wait for the next one */
@@ -148,40 +163,53 @@ static int handle_key(uint8_t sc)
         else { if (!key_held[slot]) key_latch[slot] = 1; key_held[slot] = 1; }
     }
 
+    if (code == SC_CTRL) { ctrl_held = !is_release; return 0; }
     if (is_release) {
         if (code == SC_LSHIFT || code == SC_RSHIFT) shift_held = 0;
         return 0;
     }
     if (code == SC_LSHIFT || code == SC_RSHIFT) { shift_held = 1; return 0; }
-    if (was_ext) return 0;    /* arrows etc: only exposed through the state API */
+    if (was_ext) {
+        switch (code) {           /* arrows come out as KEY_* codes, see input.h */
+        case 0x48: return KEY_UP;
+        case 0x50: return KEY_DOWN;
+        case 0x4B: return KEY_LEFT;
+        case 0x4D: return KEY_RIGHT;
+        }
+        return 0;                 /* other 0xE0 keys: state/event APIs only */
+    }
 
     char c = shift_held ? keymap_shift[code] : keymap[code];
+    /* Ctrl+letter comes out as the control code (Ctrl+S = 19), like a real
+     * terminal - apps that only accept printable chars ignore these. */
+    if (ctrl_held) {
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 1);
+        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
+        else c = 0;
+    }
     return c ? (int)(unsigned char)c : 0;
 }
 
 static void handle_mouse(uint8_t byte)
 {
     static int phase = 0;
-    static int packet[3];
+    static int packet[4];
 
-    switch (phase) {
-    case 0:
-        if (!(byte & 0x08)) return;   /* bit3 should always be set on byte 0 - resync */
-        packet[0] = byte; phase = 1;
-        break;
-    case 1:
-        packet[1] = byte; phase = 2;
-        break;
-    default: {
-        packet[2] = byte; phase = 0;
-        int flags = packet[0];
-        if (flags & 0xC0) break;      /* overflow flagged, toss this packet */
-        int dx = packet[1] - ((flags << 4) & 0x100);
-        int dy = packet[2] - ((flags << 3) & 0x100);
-        mouse_set_buttons((unsigned)(flags & 0x07));
-        mouse_move(dx, -dy);          /* PS/2 Y is up-positive, screen Y is down-positive */
-        break;
-    }
+    if (phase == 0 && !(byte & 0x08)) return;   /* bit3 should always be set on byte 0 - resync */
+    packet[phase++] = byte;
+    if (phase < (mouse_has_wheel ? 4 : 3)) return;
+    phase = 0;
+
+    int flags = packet[0];
+    if (flags & 0xC0) return;
+    int dx = packet[1] - ((flags << 4) & 0x100);
+    int dy = packet[2] - ((flags << 3) & 0x100);
+    mouse_set_buttons((unsigned)(flags & 0x07));
+    mouse_move(dx, -dy);              /* PS/2 Y is up-positive, screen Y is down-positive */
+    if (mouse_has_wheel) {
+        int dz = packet[3] & 0x0F;    /* Z delta lives in the low nibble, signed */
+        if (dz & 0x08) dz -= 16;
+        if (dz) mouse_add_wheel(dz);  /* + = wheel rolled toward the user = scroll down */
     }
 }
 
@@ -209,7 +237,7 @@ int input_poll(void)
     int first_key = 0;
     for (;;) {
         uint8_t status = inb(PS2_STAT);
-        if (!(status & 1)) break;         /* buffer's empty, we're done */
+        if (!(status & 1)) break;
         uint8_t data = inb(PS2_DATA);
         if (status & 0x20) {
             handle_mouse(data);

@@ -1,6 +1,3 @@
-/* Polling driver for the PS/2 keyboard and mouse. The controller's status
- * register tags every byte with which device it came from, so a single
- * loop can service both instead of needing separate IRQ handlers. */
 #ifndef PEFIA_INPUT_H
 #define PEFIA_INPUT_H
 
@@ -9,12 +6,21 @@ int  input_getchar(void);  /* block for a key; moves the cursor meanwhile */
 int  input_poll(void);     /* non-blocking: service pending bytes, return a
                               key char if one was pressed this call, else 0 */
 
+/* Non-ASCII keys delivered through the char stream above. The range
+ * 0x81..0x8F is reserved for these: it can't collide with printable ASCII
+ * (32..126), and as a signed char every value is negative, so consumers
+ * that only insert 32..126 ignore them without changes. */
+enum {
+    KEY_UP    = 0x81,
+    KEY_DOWN  = 0x82,
+    KEY_LEFT  = 0x83,
+    KEY_RIGHT = 0x84,
+};
+
 /* Real-time key state, for games.
- * The char stream above is fine for typing but useless for held keys, and
- * it drops arrow keys on the floor entirely. These two calls run alongside
- * it: handle_key() keeps a pressed/released bitmap for the handful of keys
- * anything game-like cares about. Arrow keys (PS/2 extended, 0xE0-prefixed)
- * only ever show up through this API.
+ * The char stream above is fine for typing but useless for held keys. These
+ * two calls run alongside it: handle_key() keeps a pressed/released bitmap
+ * for the handful of keys anything game-like cares about.
  *   input_key_down    - is the key held right now?
  *   input_key_pressed - did it go down since the last query? (latched + cleared)
  */
@@ -40,4 +46,4 @@ int  input_key_pressed(int code);
  * input_getchar() draining the controller - there's no separate pump. */
 int  input_next_event(int *scancode, int *pressed, int *ext);
 
-#endif /* PEFIA_INPUT_H */
+#endif

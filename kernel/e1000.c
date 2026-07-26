@@ -108,7 +108,7 @@ static int wait_for_bit(uint32_t off, uint32_t mask, int tries)
 static void pci_enable_mem_and_master(uint8_t bus, uint8_t slot, uint8_t func)
 {
     uint16_t cmd = pci_config_read16(bus, slot, func, 0x04);
-    cmd |= 0x0006; /* memory space decode + bus mastering */
+    cmd |= 0x0006;
     outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) | ((uint32_t)func << 8) | 0x04);
     outl(0xCFC, (uint32_t)cmd);
 }
@@ -243,7 +243,7 @@ int e1000_init(void)
 
     if (resolve_mac_address() != 0) return -3;
 
-    for (int i = 0; i < 128; i++) reg_write(REG_MTA + i * 4, 0); /* clear multicast filter table */
+    for (int i = 0; i < 128; i++) reg_write(REG_MTA + i * 4, 0);
 
     if (setup_rx_ring() != 0) return -4;
 
@@ -298,7 +298,7 @@ int e1000_poll(void)
 
     int delivered = 0;
     while (rx_ring[rx_tail_seen].status & RXD_STA_DD) {
-        uint16_t len = rx_ring[rx_tail_seen].length; /* CRC already stripped, see RCTL_SECRC */
+        uint16_t len = rx_ring[rx_tail_seen].length;
         uint8_t *frame = rx_bufs + rx_tail_seen * BUF_SZ;
 
         if ((rx_ring[rx_tail_seen].status & RXD_STA_EOP) && len >= 14 && len <= BUF_SZ) {

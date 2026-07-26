@@ -1,6 +1,3 @@
-/* kernel/net.h - the browser's window onto the network: DNS+TCP(+TLS) wrapped
- * up into "give me a URL, get me a response." Everything below net_fetch is
- * netstack.c's problem; this layer just speaks HTTP over it. */
 #ifndef PEFIA_NET_H
 #define PEFIA_NET_H
 
@@ -9,7 +6,7 @@
 typedef struct {
     int   status;            /* HTTP status code, or <0 if we never got one */
     int   is_tls;
-    char  final_url[256];    /* where we ended up after following redirects */
+    char  final_url[512];    /* where we ended up after following redirects */
     char  content_type[80];
     const char *body;        /* points into net.c's scratch buffer - copy it if you need it later */
     int   body_len;
@@ -30,4 +27,9 @@ int net_fetch(const char *url, NetResponse *resp);
  * Redirects are followed the same way as net_fetch. */
 int net_fetch_limited(const char *url, int max_body_bytes, NetResponse *resp);
 
-#endif /* PEFIA_NET_H */
+/* POST a form body (application/x-www-form-urlencoded, NUL-terminated).
+ * Redirects follow browser convention: 301/302/303 continue as a GET,
+ * 307/308 re-send the same body. */
+int net_fetch_post(const char *url, const char *body, NetResponse *resp);
+
+#endif

@@ -1,29 +1,3 @@
-/* kernel/doom_app.c
- *
- * This is the "operating system" that PureDOOM thinks it's running on.
- * PureDOOM.h is a single-header, engine-only port -- it never touches
- * hardware or a real filesystem directly, it just calls out through a
- * handful of function pointers we register once at startup. Everything
- * below exists to fill those in with something that works on top of
- * pefiaOS's window manager instead of a real OS.
- *
- * Roughly:
- *   - malloc/free            -> the kernel heap
- *   - wall clock              -> clock_ms()
- *   - "disk"                  -> a fake filesystem held entirely in RAM.
- *     Reads of doom1.wad are handed out straight from the IWAD that got
- *     linked into the kernel image by boot/doom_wad.asm; anything else
- *     (config, savegames) gets a scratch buffer so DOOM can write without
- *     immediately falling over.
- *   - stdout/exit/getenv      -> mostly no-ops, except exit, which we turn
- *     into a longjmp so a DOOM crash (I_Error) doesn't take the kernel
- *     down with it.
- *
- * The window-facing half is the usual paint/tick/resize app trio: each
- * tick we drain queued key events into DOOM, step the engine once, then
- * nearest-neighbour scale its fixed 320x200 framebuffer up into whatever
- * size the window happens to be.
- */
 #include "doom_app.h"
 #include "wm.h"
 #include "framebuffer.h"
@@ -90,13 +64,13 @@ static void str_copy_bounded(char *dst, const char *src, int cap)
  * ------------------------------------------------------------------ */
 
 #define MAX_OPEN_FILES  10
-#define SCRATCH_BYTES   (256 * 1024)   /* comfortably fits a DOOM savegame */
+#define SCRATCH_BYTES   (256 * 1024)
 
 typedef struct {
     int   in_use;
     char  name[40];
     const unsigned char *rd;   /* points into the embedded WAD, or NULL */
-    unsigned char       *wr;   /* heap scratch buffer, or NULL          */
+    unsigned char       *wr;
     int   size;
     int   cap;
     int   pos;
@@ -149,7 +123,7 @@ static void *vfs_open(const char *filename, const char *mode)
         /* not the WAD -- see if it's a scratch file we wrote earlier */
         VFile *f = vfile_find(filename);
         if (f && (f->rd || f->wr)) { f->pos = 0; return f; }
-        return NULL;   /* nothing by that name */
+        return NULL;
     }
 
     /* write mode: (re)use a scratch slot, allocating its backing buffer lazily */
@@ -323,7 +297,7 @@ static int scancode_to_doom_key(int code, int extended)
 typedef struct {
     color_t  *pixels;      /* off-screen buffer, sized to the window's client area */
     int       bw, bh;
-    int       started;     /* has doom_init() run yet? */
+    int       started;
     int       crashed;     /* did we recover from an I_Error? */
     uint32_t  last_tick_ms;
 } DoomState;

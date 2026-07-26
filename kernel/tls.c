@@ -18,8 +18,8 @@ const char *tls_status(void){ return g_status; }
  * this OS only ever needs one at a time, so globals keep it simple.
  * ========================================================================== */
 
-#define IN_CAP   33000   /* raw TCP staging buffer */
-#define HS_CAP   20000   /* reassembled handshake message buffer */
+#define IN_CAP   33000
+#define HS_CAP   20000
 #define DEC_CAP  17000   /* largest plaintext record we'll produce/consume */
 
 static int      g_open = 0;
@@ -44,10 +44,6 @@ static uint64_t g_c_ap_seq, g_s_ap_seq;
 /* decrypted application data the caller hasn't picked up with tls_recv yet */
 static uint8_t  g_appbuf[DEC_CAP];
 static int      g_app_off, g_app_len;
-
-/* ==========================================================================
- * TCP staging + TLS record framing
- * ========================================================================== */
 
 /* Makes sure at least `need` bytes are sitting in g_in[g_in_off..], pulling
  * more off the socket and compacting the buffer as needed. TLS records
@@ -135,7 +131,7 @@ static int send_encrypted(int inner_type, const uint8_t *data, int len,
     inner[len] = (uint8_t)inner_type;
     int ilen = len + 1;
 
-    int reclen = ilen + 16;   /* + GCM tag */
+    int reclen = ilen + 16;
     rec[0] = 23; rec[1] = 0x03; rec[2] = 0x03;
     rec[3] = (uint8_t)(reclen >> 8); rec[4] = (uint8_t)reclen;
 
@@ -170,10 +166,6 @@ static int decrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t 
     return g_dec[n - 1];                        /* the real content type, from the last byte */
 }
 
-/* ==========================================================================
- * ClientHello construction
- * ========================================================================== */
-
 static void put16(uint8_t *p, int v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 
 static int build_client_hello(uint8_t *out, const char *host)
@@ -182,12 +174,12 @@ static int build_client_hello(uint8_t *out, const char *host)
     uint8_t body[512];
     int b = 0;
 
-    body[b++] = 0x03; body[b++] = 0x03;            /* legacy_version, always TLS 1.2 here */
+    body[b++] = 0x03; body[b++] = 0x03;
     copy_bytes(body + b, g_crandom, 32); b += 32;
     body[b++] = 32; copy_bytes(body + b, g_session, 32); b += 32; /* legacy session id, unused by 1.3 but servers expect it */
     body[b++] = 0x00; body[b++] = 0x02;
     body[b++] = 0x13; body[b++] = 0x01;            /* the one cipher suite we speak: TLS_AES_128_GCM_SHA256 */
-    body[b++] = 0x01; body[b++] = 0x00;            /* compression methods: null only */
+    body[b++] = 0x01; body[b++] = 0x00;
 
     /* extensions block - length gets patched in once we know the size */
     int ext_len_pos = b; b += 2;
@@ -197,7 +189,7 @@ static int build_client_hello(uint8_t *out, const char *host)
     put16(body + b, 0x0000); b += 2;
     put16(body + b, hlen + 5); b += 2;
     put16(body + b, hlen + 3); b += 2;
-    body[b++] = 0x00;                              /* name type: host_name */
+    body[b++] = 0x00;
     put16(body + b, hlen); b += 2;
     copy_bytes(body + b, host, hlen); b += hlen;
 
@@ -235,9 +227,9 @@ static int build_client_hello(uint8_t *out, const char *host)
     put16(body + ext_len_pos, b - ext_start);
 
     /* handshake message wrapper: record header + type(1)/length(3) + body */
-    out[0] = 0x16; out[1] = 0x03; out[2] = 0x01;   /* handshake record, legacy version 0x0301 */
+    out[0] = 0x16; out[1] = 0x03; out[2] = 0x01;
     int rec_len_pos = 3;
-    out[5] = 0x01;                                  /* ClientHello */
+    out[5] = 0x01;
     out[6] = (uint8_t)(b >> 16); out[7] = (uint8_t)(b >> 8); out[8] = (uint8_t)b;
     copy_bytes(out + 9, body, b);
     int total_hs = 4 + b;
@@ -249,10 +241,6 @@ static int build_client_hello(uint8_t *out, const char *host)
     return 5 + total_hs;
 }
 
-/* ==========================================================================
- * ServerHello parsing
- * ========================================================================== */
-
 static int parse_server_hello(const uint8_t *p, int len, uint8_t server_pub[32])
 {
     /* p is a handshake message: type(1) length(3) body */
@@ -262,7 +250,7 @@ static int parse_server_hello(const uint8_t *p, int len, uint8_t server_pub[32])
     if (blen + 4 > len) return -1;
     int i = 0;
     if (blen < 2 + 32 + 1) return -1;
-    i += 2;                                  /* legacy_version, ignored */
+    i += 2;
 
     /* the server_random field doubles as a HelloRetryRequest marker when
      * it equals this fixed value from RFC 8446 4.1.3 - check before
@@ -274,9 +262,9 @@ static int parse_server_hello(const uint8_t *p, int len, uint8_t server_pub[32])
     for (int k = 0; k < 32; k++) if (b[i+k] != hrr_magic[k]) { is_hrr = 0; break; }
     if (is_hrr) return -2;   /* we don't retry with a different group, just bail */
     i += 32;
-    int sidlen = b[i++]; i += sidlen;        /* echoed session id, unused */
-    i += 2;                                  /* cipher_suite - we only offered one */
-    i += 1;                                  /* legacy compression method */
+    int sidlen = b[i++]; i += sidlen;
+    i += 2;
+    i += 1;
     if (i + 2 > blen) return -1;
     int extlen = (b[i] << 8) | b[i+1]; i += 2;
     int extend = i + extlen;
@@ -286,7 +274,7 @@ static int parse_server_hello(const uint8_t *p, int len, uint8_t server_pub[32])
         int el = (b[i+2] << 8) | b[i+3];
         i += 4;
         if (i + el > extend) break;
-        if (et == 0x0033) {                  /* key_share */
+        if (et == 0x0033) {
             int grp = (b[i] << 8) | b[i+1];
             int klen = (b[i+2] << 8) | b[i+3];
             if (grp == 0x001d && klen == 32) { copy_bytes(server_pub, b + i + 4, 32); got_key = 1; }
@@ -295,10 +283,6 @@ static int parse_server_hello(const uint8_t *p, int len, uint8_t server_pub[32])
     }
     return got_key ? 0 : -1;
 }
-
-/* ==========================================================================
- * handshake secret derivation + state machine
- * ========================================================================== */
 
 static void compute_handshake_secrets(const uint8_t server_pub[32])
 {
@@ -314,7 +298,7 @@ static void compute_handshake_secrets(const uint8_t server_pub[32])
     derive_secret(early, "derived", empty_hash, derived);
     hkdf_extract(derived, 32, shared, 32, g_hs_secret);
 
-    th_snapshot(th);                          /* transcript so far: ClientHello..ServerHello */
+    th_snapshot(th);
     derive_secret(g_hs_secret, "c hs traffic", th, g_c_hs);
     derive_secret(g_hs_secret, "s hs traffic", th, g_s_hs);
     derive_keyiv(g_c_hs, g_c_hs_key, g_c_hs_iv);
@@ -330,7 +314,7 @@ static void compute_app_secrets(void)
     derive_secret(g_hs_secret, "derived", empty_hash, derived);
     hkdf_extract(derived, 32, zero, 32, master);
 
-    th_snapshot(th);                          /* transcript: ClientHello..server Finished */
+    th_snapshot(th);
     derive_secret(master, "c ap traffic", th, g_c_ap);
     derive_secret(master, "s ap traffic", th, g_s_ap);
     derive_keyiv(g_c_ap, g_c_ap_key, g_c_ap_iv);
@@ -352,9 +336,9 @@ static int feed_handshake(uint8_t *hs, int *hs_len)
         uint8_t *m = hs + consumed;
         int mtype = m[0];
         int mlen = (m[1] << 16) | (m[2] << 8) | m[3];
-        if (4 + mlen > *hs_len - consumed) break;      /* message not fully buffered yet */
+        if (4 + mlen > *hs_len - consumed) break;
 
-        if (mtype == 20) {                              /* Finished */
+        if (mtype == 20) {
             uint8_t fkey[32], expect[32], th[32];
             th_snapshot(th);                            /* covers up to CertificateVerify, not this message */
             hkdf_expand_label(g_s_hs, "finished", 0, 0, fkey, 32);
@@ -370,7 +354,7 @@ static int feed_handshake(uint8_t *hs, int *hs_len)
             return 1;
         }
 
-        sha256_update(&g_th, m, 4 + mlen);              /* EncryptedExtensions / Certificate / CertificateVerify */
+        sha256_update(&g_th, m, 4 + mlen);
         consumed += 4 + mlen;
     }
     *hs_len -= consumed;
@@ -413,7 +397,7 @@ int tls_connect(const char *host, uint32_t ip, uint16_t port)
     int have_sh = 0;
     for (int guard = 0; guard < 8 && !have_sh; guard++) {
         if (read_record(6000)) { set_status("no ServerHello"); return -3; }
-        if (g_rec_type == 0x14) continue;             /* the middlebox-friendly CCS, skip it */
+        if (g_rec_type == 0x14) continue;
         if (g_rec_type == 0x16) {
             int r = parse_server_hello(g_rec_payload, g_rec_len, server_pub);
             if (r == -2) { set_status("HelloRetryRequest unsupported"); return -4; }
@@ -466,10 +450,6 @@ int tls_connect(const char *host, uint32_t ip, uint16_t port)
     return 0;
 }
 
-/* ==========================================================================
- * application data
- * ========================================================================== */
-
 int tls_send(const uint8_t *data, int len)
 {
     if (!g_open) return -1;
@@ -517,8 +497,8 @@ int tls_recv(uint8_t *buf, int cap, int timeout_ms)
             }
             return n;
         }
-        if (it == 21) { g_open = 0; return -1; }      /* alert, almost certainly close_notify */
-        if (it == 22) {                               /* post-handshake handshake message */
+        if (it == 21) { g_open = 0; return -1; }
+        if (it == 22) {
             if (g_dec_len >= 1 && g_dec[0] == 24) {   /* KeyUpdate: ratchet the server's traffic secret forward */
                 uint8_t next_secret[32];
                 hkdf_expand_label(g_s_ap, "traffic upd", 0, 0, next_secret, 32);
@@ -537,7 +517,7 @@ int tls_is_open(void) { return g_open; }
 void tls_close(void)
 {
     if (g_open) {
-        uint8_t alert[2] = {1, 0};                    /* level=warning, description=close_notify */
+        uint8_t alert[2] = {1, 0};
         send_encrypted(21, alert, 2, g_c_ap_key, g_c_ap_iv, &g_c_ap_seq);
     }
     tcp_close();

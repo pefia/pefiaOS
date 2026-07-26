@@ -48,8 +48,6 @@ static uint16_t pseudo_csum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto, con
     return csum_fold(sum);
 }
 
-/* ---- link state ---- */
-
 #define ETH_HDR   14
 #define IP_HDR    20
 
@@ -88,7 +86,7 @@ static struct {
     uint32_t local_ip, remote_ip;
     uint16_t local_port, remote_port;
     uint8_t  remote_mac[6];
-    uint32_t snd_una, snd_nxt;       /* send sequence space */
+    uint32_t snd_una, snd_nxt;
     uint32_t rcv_nxt;                /* next sequence number we expect from the peer */
     int      syn_acked;
     int      fin_recv;
@@ -99,8 +97,6 @@ static struct {
 
 static int rcv_used(void) { int d = g_tcp.rhead - g_tcp.rtail; if (d < 0) d += RCV_CAP; return d; }
 static int rcv_free(void) { return RCV_CAP - 1 - rcv_used(); }
-
-/* ---- ethernet / arp ---- */
 
 static void eth_send(const uint8_t dst[6], uint16_t ethertype, const uint8_t *payload, int len)
 {
@@ -130,9 +126,9 @@ static int arp_lookup(uint32_t ip, uint8_t mac[6])
 static void arp_send(int reply, uint32_t target_ip, const uint8_t target_mac[6])
 {
     uint8_t p[28];
-    wr16(p + 0, 1);           /* HTYPE: ethernet */
-    wr16(p + 2, ET_IPV4);     /* PTYPE */
-    p[4] = 6; p[5] = 4;       /* HLEN / PLEN */
+    wr16(p + 0, 1);
+    wr16(p + 2, ET_IPV4);
+    p[4] = 6; p[5] = 4;
     wr16(p + 6, reply ? 2 : 1);
     kmemmove(p + 8, g_mac, 6);
     ip_to_bytes(g_ip, p + 14);
@@ -149,7 +145,7 @@ static void handle_arp(const uint8_t *frame, int len)
     uint32_t sender_ip = ip_from_bytes(a + 14);
     uint32_t target_ip = ip_from_bytes(a + 24);
     arp_learn(sender_ip, a + 8);
-    if (op == 1 && target_ip == g_ip)         /* someone's asking who has us */
+    if (op == 1 && target_ip == g_ip)
         arp_send(1, sender_ip, a + 8);
 }
 
@@ -172,28 +168,26 @@ static int resolve_mac(uint32_t ip, uint8_t mac[6])
     return 0;
 }
 
-/* ---- ipv4 ---- */
-
 static uint16_t g_ip_id = 0x1000;
 
 static int ip_send(uint8_t proto, uint32_t dst, const uint8_t *payload, int plen)
 {
     uint8_t mac[6];
     if (dst == 0xFFFFFFFFu) {
-        for (int i = 0; i < 6; i++) mac[i] = 0xFF;     /* broadcast never needs ARP */
+        for (int i = 0; i < 6; i++) mac[i] = 0xFF;
     } else if (!resolve_mac(dst, mac)) {
         return -1;
     }
 
     uint8_t hdr[IP_HDR];
     hdr[0] = 0x45;                 /* version 4, IHL 5 (no options) */
-    hdr[1] = 0x00;                 /* DSCP/ECN, we don't care */
+    hdr[1] = 0x00;
     wr16(hdr + 2, (uint16_t)(IP_HDR + plen));
     wr16(hdr + 4, g_ip_id++);
-    wr16(hdr + 6, 0x4000);         /* don't-fragment; we never fragment anyway */
-    hdr[8] = 64;                   /* TTL */
+    wr16(hdr + 6, 0x4000);
+    hdr[8] = 64;
     hdr[9] = proto;
-    wr16(hdr + 10, 0);             /* checksum, filled in below */
+    wr16(hdr + 10, 0);
     ip_to_bytes(g_ip, hdr + 12);
     ip_to_bytes(dst, hdr + 16);
     wr16(hdr + 10, csum_fold(csum_add(0, hdr, IP_HDR)));
@@ -216,13 +210,11 @@ static void handle_icmp(uint32_t src, const uint8_t *p, int len)
     static uint8_t reply[1500];
     if (len > (int)sizeof(reply)) return;
     kmemmove(reply, p, len);
-    reply[0] = 0;                                /* type 0 = echo reply */
+    reply[0] = 0;
     wr16(reply + 2, 0);
     wr16(reply + 2, csum_fold(csum_add(0, reply, len)));
     ip_send(IPPROTO_ICMP, src, reply, len);
 }
-
-/* ---- udp ---- */
 
 static void udp_send(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
                      const uint8_t *data, int len)
@@ -290,8 +282,8 @@ static void tcp_xmit(uint8_t flags, const uint8_t *data, int dlen)
     seg[13] = flags;
     int win = rcv_free(); if (win > 65535) win = 65535;
     wr16(seg + 14, (uint16_t)win);
-    wr16(seg + 16, 0);                   /* checksum, filled below */
-    wr16(seg + 18, 0);                   /* urgent pointer, unused */
+    wr16(seg + 16, 0);
+    wr16(seg + 18, 0);
     if (data && dlen > 0) kmemmove(seg + hlen, data, dlen);
 
     int total = hlen + dlen;
@@ -318,10 +310,10 @@ static void handle_tcp(uint32_t src, const uint8_t *p, int len)
     int dlen = len - off;
     if (dlen < 0) dlen = 0;
 
-    if (flags & 0x04) { g_tcp.reset = 1; g_tcp.state = TCP_CLOSED; return; }   /* RST: we're done */
+    if (flags & 0x04) { g_tcp.reset = 1; g_tcp.state = TCP_CLOSED; return; }
 
     if (g_tcp.state == TCP_SYN_SENT) {
-        if ((flags & 0x12) == 0x12) {           /* SYN+ACK */
+        if ((flags & 0x12) == 0x12) {
             g_tcp.rcv_nxt = rseq + 1;
             g_tcp.snd_una = rack;
             g_tcp.state = TCP_ESTAB;
@@ -347,7 +339,7 @@ static void handle_tcp(uint32_t src, const uint8_t *p, int len)
         g_tcp.rcv_nxt += n;
         tcp_ack();
     } else if (dlen > 0 && rseq != g_tcp.rcv_nxt) {
-        tcp_ack();                               /* stale retransmit or reordered segment */
+        tcp_ack();
     }
 
     if (flags & 0x01) {                          /* FIN, but only once it's actually next in line */
@@ -402,7 +394,7 @@ int tcp_send(const uint8_t *data, int len)
         int acked = 0;
         for (int tries = 0; tries < 8 && !acked; tries++) {
             g_tcp.snd_nxt = seg_seq;
-            tcp_xmit(0x18, data + sent, chunk);  /* PSH|ACK */
+            tcp_xmit(0x18, data + sent, chunk);
             g_tcp.snd_nxt = seg_seq + chunk;
             uint32_t t0 = clock_ms();
             while ((uint32_t)(clock_ms() - t0) < 500) {
@@ -446,7 +438,7 @@ int tcp_closed(void)
 void tcp_close(void)
 {
     if (g_tcp.state == TCP_ESTAB || g_tcp.state == TCP_CLOSE_WAIT) {
-        tcp_xmit(0x11, 0, 0);                    /* FIN|ACK */
+        tcp_xmit(0x11, 0, 0);
         g_tcp.snd_nxt += 1;
         uint32_t t0 = clock_ms();
         while ((uint32_t)(clock_ms() - t0) < 300) netstack_poll();   /* give the FIN a chance to land */
@@ -502,18 +494,18 @@ static uint32_t g_xid = 0x50454649;   /* "PEFI" - just needs to be recognizable 
 static int dhcp_build(uint8_t *b, int msgtype, uint32_t req_ip, uint32_t server_id)
 {
     kmemset(b, 0, 300);
-    b[0] = 1; b[1] = 1; b[2] = 6; b[3] = 0;       /* op=request, htype=eth, hlen=6, hops=0 */
+    b[0] = 1; b[1] = 1; b[2] = 6; b[3] = 0;
     wr32(b + 4, g_xid);
     wr16(b + 10, 0x8000);                          /* ask for a broadcast reply, we have no IP yet */
-    kmemmove(b + 28, g_mac, 6);                    /* chaddr */
-    wr32(b + 236, 0x63825363);                     /* DHCP magic cookie */
+    kmemmove(b + 28, g_mac, 6);
+    wr32(b + 236, 0x63825363);
 
     int o = 240;
-    b[o++] = 53; b[o++] = 1; b[o++] = (uint8_t)msgtype;                          /* message type */
-    b[o++] = 55; b[o++] = 4; b[o++] = 1; b[o++] = 3; b[o++] = 6; b[o++] = 15;    /* param req list */
-    if (req_ip)    { b[o++] = 50; b[o++] = 4; ip_to_bytes(req_ip, b + o); o += 4; }     /* requested IP */
-    if (server_id) { b[o++] = 54; b[o++] = 4; ip_to_bytes(server_id, b + o); o += 4; }  /* server id */
-    b[o++] = 61; b[o++] = 7; b[o++] = 1; kmemmove(b + o, g_mac, 6); o += 6;             /* client id */
+    b[o++] = 53; b[o++] = 1; b[o++] = (uint8_t)msgtype;
+    b[o++] = 55; b[o++] = 4; b[o++] = 1; b[o++] = 3; b[o++] = 6; b[o++] = 15;
+    if (req_ip)    { b[o++] = 50; b[o++] = 4; ip_to_bytes(req_ip, b + o); o += 4; }
+    if (server_id) { b[o++] = 54; b[o++] = 4; ip_to_bytes(server_id, b + o); o += 4; }
+    b[o++] = 61; b[o++] = 7; b[o++] = 1; kmemmove(b + o, g_mac, 6); o += 6;
     b[o++] = 255;
 
     return o < 300 ? 300 : o;    /* BOOTP wants at least a 300-byte body, padding is free */
@@ -530,7 +522,7 @@ static int dhcp_parse(const uint8_t *b, int len, int *msgtype, uint32_t *yip,
     while (o < len) {
         uint8_t opt = b[o++];
         if (opt == 255) break;
-        if (opt == 0) continue;         /* pad */
+        if (opt == 0) continue;
         if (o >= len) break;
         uint8_t optlen = b[o++];
         if (o + optlen > len) break;    /* truncated option, bail rather than read past the buffer */
@@ -550,17 +542,17 @@ static int dhcp_configure(void)
     g_udp_filter = 68;
 
     for (int attempt = 0; attempt < 3; attempt++) {
-        int n = dhcp_build(pkt, 1 /* DISCOVER */, 0, 0);
+        int n = dhcp_build(pkt, 1 , 0, 0);
         g_udp_ready = 0;
         g_ip = 0;
         udp_send(0xFFFFFFFFu, 68, 67, pkt, n);
         if (!udp_wait(1500)) continue;
 
         int mt; uint32_t yip, sid, mask, gw, dns;
-        if (!dhcp_parse(g_udp_buf, g_udp_len, &mt, &yip, &sid, &mask, &gw, &dns) || mt != 2 /* OFFER */)
+        if (!dhcp_parse(g_udp_buf, g_udp_len, &mt, &yip, &sid, &mask, &gw, &dns) || mt != 2 )
             continue;
 
-        n = dhcp_build(pkt, 3 /* REQUEST */, yip, sid);
+        n = dhcp_build(pkt, 3 , yip, sid);
         g_udp_ready = 0;
         udp_send(0xFFFFFFFFu, 68, 67, pkt, n);
         if (!udp_wait(1500)) continue;
@@ -568,7 +560,7 @@ static int dhcp_configure(void)
         int mt2; uint32_t yip2, sid2, mask2, gw2, dns2;
         if (!dhcp_parse(g_udp_buf, g_udp_len, &mt2, &yip2, &sid2, &mask2, &gw2, &dns2))
             continue;
-        if (mt2 != 5 /* ACK */) continue;
+        if (mt2 != 5 ) continue;
 
         g_ip   = yip2 ? yip2 : yip;
         g_mask = mask2 ? mask2 : 0xFFFFFF00u;
@@ -606,7 +598,7 @@ static int dns_encode_name(uint8_t *out, int cap, const char *host)
             label++;
         }
     }
-    out[labelpos] = 0;                             /* root terminator */
+    out[labelpos] = 0;
     return o;
 }
 
@@ -635,8 +627,8 @@ int dns_resolve(const char *host, uint32_t *ip_out)
     uint16_t sport = (uint16_t)(50000 + (rdtsc() & 0x0FFF));
 
     wr16(q + 0, id);
-    wr16(q + 2, 0x0100);     /* recursion desired, standard query */
-    wr16(q + 4, 1);          /* qdcount */
+    wr16(q + 2, 0x0100);
+    wr16(q + 4, 1);
     wr16(q + 6, 0);
     wr16(q + 8, 0);
     wr16(q + 10, 0);
@@ -645,8 +637,8 @@ int dns_resolve(const char *host, uint32_t *ip_out)
     int namelen = dns_encode_name(q + o, (int)sizeof(q) - o, host);
     if (namelen < 0) return -1;
     o += namelen;
-    wr16(q + o, 1); o += 2;  /* QTYPE A */
-    wr16(q + o, 1); o += 2;  /* QCLASS IN */
+    wr16(q + o, 1); o += 2;
+    wr16(q + o, 1); o += 2;
 
     g_udp_filter = sport;
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -660,15 +652,15 @@ int dns_resolve(const char *host, uint32_t *ip_out)
 
         int qd = rd16(r + 4), an = rd16(r + 6);
         int p = 12;
-        for (int i = 0; i < qd && p < rl; i++) {       /* skip over the question section */
+        for (int i = 0; i < qd && p < rl; i++) {
             while (p < rl && r[p] != 0) {
                 if ((r[p] & 0xC0) == 0xC0) { p += 2; goto question_done; }
                 p += r[p] + 1;
             }
             p += 1;
-        question_done: p += 4;                          /* qtype + qclass */
+        question_done: p += 4;
         }
-        for (int i = 0; i < an && p < rl; i++) {        /* walk the answer records */
+        for (int i = 0; i < an && p < rl; i++) {
             if ((r[p] & 0xC0) == 0xC0) p += 2;
             else { while (p < rl && r[p] != 0) p += r[p] + 1; p += 1; }
             if (p + 10 > rl) break;
@@ -687,8 +679,6 @@ int dns_resolve(const char *host, uint32_t *ip_out)
     return -1;
 }
 
-/* ---- init / accessors ---- */
-
 int netstack_init(void)
 {
     kmemset(g_arp, 0, sizeof(g_arp));
@@ -703,10 +693,10 @@ int netstack_init(void)
     if (!dhcp_configure()) {
         /* Nobody answered - assume we're under QEMU SLIRP or VirtualBox NAT
          * and use their well-known defaults instead of giving up entirely. */
-        g_ip   = 0x0A00020F;   /* 10.0.2.15 */
-        g_mask = 0xFFFFFF00;   /* 255.255.255.0 */
-        g_gw   = 0x0A000202;   /* 10.0.2.2 */
-        g_dns  = 0x0A000203;   /* 10.0.2.3 */
+        g_ip   = 0x0A00020F;
+        g_mask = 0xFFFFFF00;
+        g_gw   = 0x0A000202;
+        g_dns  = 0x0A000203;
     }
     g_up = 1;
     return 1;

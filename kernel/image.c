@@ -218,13 +218,130 @@ static int png_decode(const uint8_t *data, int len, Bitmap *out)
 }
 
 /* --- GIF ---------------------------------------------------------------
- * 87a/89a, first frame only (no animation support - we're not trying to
- * be a GIF player, just render whatever's embedded in a page). Handles
- * Adam7-style GIF interlacing since that one's cheap: four passes over
- * a flat index buffer instead of a real streaming decode.
+ * 87a/89a with animation: each image descriptor is composited onto a
+ * persistent logical-screen canvas and snapshotted into its own Bitmap.
+ * Handles GIF interlacing since that one's cheap: four passes over a
+ * flat index buffer instead of a real streaming decode.
  */
 
-static int gif_decode(const uint8_t *data, int len, Bitmap *out)
+/* Decodes one image's LZW sub-blocks (starting at the min-code-size byte
+ * at *pp) into a fresh iw*ih index buffer in top-to-bottom row order,
+ * interlacing undone. Advances *pp past the block terminator. Returns
+ * the kmalloc'd buffer, or 0 on failure. */
+static uint8_t *gif_lzw_frame(const uint8_t *data, int len, int *pp,
+                              int iw, int ih, int interlaced)
+{
+    int p = *pp;
+    int min_code_size = (p < len) ? data[p++] : 8;
+    if (min_code_size < 2 || min_code_size > 8) return 0;
+
+    /* Sub-blocks of LZW-compressed indices - reassemble into one
+     * contiguous buffer before decoding. */
+    int comp_cap = len;
+    uint8_t *comp = (uint8_t *)kmalloc(comp_cap);
+    if (!comp) return 0;
+    int comp_len = 0;
+    while (p < len) {
+        int sz = data[p++];
+        if (!sz) break;
+        for (int i = 0; i < sz && p < len; i++) comp[comp_len++] = data[p++];
+    }
+
+    int clear_code = 1 << min_code_size;
+    int eoi_code = clear_code + 1;
+    int code_bits = min_code_size + 1;
+    int next_code = eoi_code + 1;
+    static int lzw_prefix[4096];
+    static uint8_t lzw_suffix[4096], lzw_first[4096];
+    uint8_t *indices = (uint8_t *)kmalloc(iw * ih);
+    if (!indices) { kfree(comp); return 0; }
+    for (int i = 0; i < iw * ih; i++) indices[i] = 0; /* truncated data reads as index 0 */
+    int written = 0;
+    int bitpos = 0;
+    int prev_code = -1;
+    uint8_t stack[4096];
+    int sp = 0;
+
+    for (int i = 0; i < clear_code; i++) {
+        lzw_prefix[i] = -1; lzw_suffix[i] = (uint8_t)i; lzw_first[i] = (uint8_t)i;
+    }
+
+    while (bitpos + code_bits <= comp_len * 8) {
+        int code = 0;
+        for (int i = 0; i < code_bits; i++) {
+            int byte_idx = (bitpos + i) >> 3, bit_idx = (bitpos + i) & 7;
+            if (byte_idx < comp_len && (comp[byte_idx] >> bit_idx) & 1) code |= (1 << i);
+        }
+        bitpos += code_bits;
+
+        if (code == clear_code) {
+            code_bits = min_code_size + 1;
+            next_code = eoi_code + 1;
+            prev_code = -1;
+            continue;
+        }
+        if (code == eoi_code) break;
+
+        if (prev_code == -1) {
+            if (code < next_code) {
+                if (written < iw * ih) indices[written++] = lzw_first[code];
+                prev_code = code;
+            }
+            continue;
+        }
+
+        int incoming = code;
+        sp = 0;
+        if (code >= next_code) { stack[sp++] = lzw_first[prev_code]; code = prev_code; }
+        while (code >= clear_code) {
+            if (sp >= 4096 || code < 0 || code >= 4096) break;
+            stack[sp++] = lzw_suffix[code];
+            code = lzw_prefix[code];
+        }
+        if (code >= 0 && code < 4096) stack[sp++] = lzw_first[code];
+
+        int leader = (code >= 0 && code < 4096) ? lzw_first[code] : 0;
+        while (sp > 0 && written < iw * ih) indices[written++] = stack[--sp];
+
+        if (next_code < 4096) {
+            lzw_prefix[next_code] = prev_code;
+            lzw_suffix[next_code] = (uint8_t)leader;
+            lzw_first[next_code] = lzw_first[prev_code];
+            next_code++;
+            if (next_code == (1 << code_bits) && code_bits < 12) code_bits++;
+        }
+        prev_code = incoming;
+    }
+    kfree(comp);
+
+    /* indices[] holds rows in storage order; for interlaced GIFs that's
+     * four passes at increasing density - permute into plain row order. */
+    if (interlaced) {
+        uint8_t *ordered = (uint8_t *)kmalloc(iw * ih);
+        if (!ordered) { kfree(indices); return 0; }
+        static const int PASS_START[4] = {0, 4, 2, 1};
+        static const int PASS_STEP[4]  = {8, 8, 4, 2};
+        int src_row = 0;
+        for (int pass = 0; pass < 4; pass++) {
+            for (int row = PASS_START[pass]; row < ih; row += PASS_STEP[pass]) {
+                for (int col = 0; col < iw; col++)
+                    ordered[row * iw + col] = indices[src_row * iw + col];
+                src_row++;
+            }
+        }
+        kfree(indices);
+        indices = ordered;
+    }
+
+    *pp = p;
+    return indices;
+}
+
+/* Walks the whole GIF, compositing each frame onto a logical-screen
+ * canvas and snapshotting up to max_frames of them. Anything that goes
+ * wrong mid-stream (truncation, junk block, allocation failure) keeps
+ * whatever frames were already banked; only a total failure returns -1. */
+static int gif_decode_frames(const uint8_t *data, int len, AnimBitmap *out, int max_frames)
 {
     if (len < 13) return -1;
     if (data[0] != 'G' || data[1] != 'I' || data[2] != 'F') return -1;
@@ -236,6 +353,11 @@ static int gif_decode(const uint8_t *data, int len, Bitmap *out)
     int gct_size = 2 << (flags & 7);
     if (width <= 0 || height <= 0 || (long)width * height > MAX_PIXELS) return -1;
 
+    /* A big animation multiplies its canvas by the frame count; past 4MB
+     * per frame quietly fall back to first-frame-only so one hostile GIF
+     * can't eat 16x the memory. */
+    if ((long)width * height * 4 > 4 * 1024 * 1024) max_frames = 1;
+
     uint8_t gct[256][3];
     for (int i = 0; i < 256; i++) { gct[i][0] = gct[i][1] = gct[i][2] = 0; }
     int p = 13;
@@ -246,20 +368,27 @@ static int gif_decode(const uint8_t *data, int len, Bitmap *out)
         }
     }
 
+    uint32_t *canvas = (uint32_t *)kmalloc((uint32_t)(width * height * 4));
+    if (!canvas) return -1;
+    for (int i = 0; i < width * height; i++) canvas[i] = 0;
+
     int transparent_idx = -1;
+    int disposal = 0;
+    int delay_units = 0;
+    out->count = 0;
 
-    /* Walk top-level blocks (extensions, comments, etc.) until we find
-     * the first image descriptor - that's the frame we render. */
-    while (p < len) {
+    while (p < len && out->count < max_frames) {
         uint8_t block = data[p++];
-        if (block == 0x3B) return -1; /* trailer reached, no image in file */
+        if (block == 0x3B) break;
 
-        if (block == 0x21) { /* extension block */
+        if (block == 0x21) {
             uint8_t label = (p < len) ? data[p++] : 0;
-            if (label == 0xF9) { /* graphic control extension */
+            if (label == 0xF9) {
                 int sz = (p < len) ? data[p++] : 0;
                 if (sz >= 4 && p + 4 <= len) {
                     if (data[p] & 1) transparent_idx = data[p + 3];
+                    disposal = (data[p] >> 2) & 7;
+                    delay_units = data[p + 1] | (data[p + 2] << 8);
                 }
                 p += sz;
             }
@@ -267,136 +396,81 @@ static int gif_decode(const uint8_t *data, int len, Bitmap *out)
             continue;
         }
 
-        if (block == 0x2C) { /* image descriptor */
-            if (p + 9 > len) return -1;
-            int iw = data[p+4] | (data[p+5] << 8);
-            int ih = data[p+6] | (data[p+7] << 8);
-            int local_flags = data[p+8];
-            int interlaced = (local_flags & 0x40) != 0;
-            p += 9;
+        if (block != 0x2C) break; /* some block type we don't understand - give up */
 
-            uint8_t lct[256][3];
-            for (int i = 0; i < 256; i++) { lct[i][0] = lct[i][1] = lct[i][2] = 0; }
-            int has_lct = (local_flags & 0x80) != 0;
-            int lct_size = 2 << (local_flags & 7);
-            uint8_t (*active_pal)[3] = gct;
-            if (has_lct) {
-                for (int i = 0; i < lct_size && p + 3 <= len; i++) {
-                    lct[i][0] = data[p]; lct[i][1] = data[p+1]; lct[i][2] = data[p+2];
-                    p += 3;
-                }
-                active_pal = lct;
+        if (p + 9 > len) break;
+        int left = data[p]   | (data[p+1] << 8);
+        int top  = data[p+2] | (data[p+3] << 8);
+        int iw = data[p+4] | (data[p+5] << 8);
+        int ih = data[p+6] | (data[p+7] << 8);
+        int local_flags = data[p+8];
+        int interlaced = (local_flags & 0x40) != 0;
+        p += 9;
+
+        uint8_t lct[256][3];
+        for (int i = 0; i < 256; i++) { lct[i][0] = lct[i][1] = lct[i][2] = 0; }
+        int has_lct = (local_flags & 0x80) != 0;
+        int lct_size = 2 << (local_flags & 7);
+        uint8_t (*active_pal)[3] = gct;
+        if (has_lct) {
+            for (int i = 0; i < lct_size && p + 3 <= len; i++) {
+                lct[i][0] = data[p]; lct[i][1] = data[p+1]; lct[i][2] = data[p+2];
+                p += 3;
             }
-            if (iw <= 0 || ih <= 0 || (long)iw * ih > MAX_PIXELS) return -1;
+            active_pal = lct;
+        }
+        if (iw <= 0 || ih <= 0 || (long)iw * ih > MAX_PIXELS) break;
 
-            int min_code_size = (p < len) ? data[p++] : 8;
-            if (min_code_size < 2 || min_code_size > 8) return -1;
+        uint8_t *indices = gif_lzw_frame(data, len, &p, iw, ih, interlaced);
+        if (!indices) break;
 
-            /* Sub-blocks of LZW-compressed indices - reassemble into one
-             * contiguous buffer before decoding. */
-            int comp_cap = len;
-            uint8_t *comp = (uint8_t *)kmalloc(comp_cap);
-            if (!comp) return -1;
-            int comp_len = 0;
-            while (p < len) {
-                int sz = data[p++];
-                if (!sz) break;
-                for (int i = 0; i < sz && p < len; i++) comp[comp_len++] = data[p++];
+        /* Composite the sub-image onto the canvas, clipped to the logical
+         * screen; transparent-index pixels leave the canvas untouched. */
+        for (int row = 0; row < ih && top + row < height; row++) {
+            for (int col = 0; col < iw && left + col < width; col++) {
+                int ci = indices[row * iw + col];
+                if (ci == transparent_idx) continue;
+                canvas[(top + row) * width + (left + col)] =
+                    pack_argb(255, active_pal[ci][0], active_pal[ci][1], active_pal[ci][2]);
             }
+        }
+        kfree(indices);
 
-            int clear_code = 1 << min_code_size;
-            int eoi_code = clear_code + 1;
-            int code_bits = min_code_size + 1;
-            int next_code = eoi_code + 1;
-            static int lzw_prefix[4096];
-            static uint8_t lzw_suffix[4096], lzw_first[4096];
-            uint8_t *indices = (uint8_t *)kmalloc(iw * ih);
-            if (!indices) { kfree(comp); return -1; }
-            int written = 0;
-            int bitpos = 0;
-            int prev_code = -1;
-            uint8_t stack[4096];
-            int sp = 0;
+        Bitmap *fr = &out->frames[out->count];
+        if (alloc_bitmap(fr, width, height) != 0) break;
+        for (int i = 0; i < width * height; i++) fr->pixels[i] = canvas[i];
+        int delay_ms = delay_units * 10;
+        if (delay_ms < 20) delay_ms = 100;
+        out->delays_ms[out->count] = delay_ms;
+        out->count++;
 
-            for (int i = 0; i < clear_code; i++) {
-                lzw_prefix[i] = -1; lzw_suffix[i] = (uint8_t)i; lzw_first[i] = (uint8_t)i;
-            }
-
-            while (bitpos + code_bits <= comp_len * 8) {
-                int code = 0;
-                for (int i = 0; i < code_bits; i++) {
-                    int byte_idx = (bitpos + i) >> 3, bit_idx = (bitpos + i) & 7;
-                    if (byte_idx < comp_len && (comp[byte_idx] >> bit_idx) & 1) code |= (1 << i);
-                }
-                bitpos += code_bits;
-
-                if (code == clear_code) {
-                    code_bits = min_code_size + 1;
-                    next_code = eoi_code + 1;
-                    prev_code = -1;
-                    continue;
-                }
-                if (code == eoi_code) break;
-
-                if (prev_code == -1) {
-                    if (code < next_code) {
-                        if (written < iw * ih) indices[written++] = lzw_first[code];
-                        prev_code = code;
-                    }
-                    continue;
-                }
-
-                int incoming = code;
-                sp = 0;
-                if (code >= next_code) { stack[sp++] = lzw_first[prev_code]; code = prev_code; }
-                while (code >= clear_code) {
-                    if (sp >= 4096 || code < 0 || code >= 4096) break;
-                    stack[sp++] = lzw_suffix[code];
-                    code = lzw_prefix[code];
-                }
-                if (code >= 0 && code < 4096) stack[sp++] = lzw_first[code];
-
-                int leader = (code >= 0 && code < 4096) ? lzw_first[code] : 0;
-                while (sp > 0 && written < iw * ih) indices[written++] = stack[--sp];
-
-                if (next_code < 4096) {
-                    lzw_prefix[next_code] = prev_code;
-                    lzw_suffix[next_code] = (uint8_t)leader;
-                    lzw_first[next_code] = lzw_first[prev_code];
-                    next_code++;
-                    if (next_code == (1 << code_bits) && code_bits < 12) code_bits++;
-                }
-                prev_code = incoming;
-            }
-            kfree(comp);
-
-            if (alloc_bitmap(out, iw, ih) != 0) { kfree(indices); return -1; }
-
-            /* indices[] holds rows in storage order; for interlaced GIFs
-             * that's four passes at increasing density, not top-to-bottom. */
-            static const int PASS_START[4] = {0, 4, 2, 1};
-            static const int PASS_STEP[4]  = {8, 8, 4, 2};
-            int src_row = 0;
-            for (int pass = 0; pass < (interlaced ? 4 : 1); pass++) {
-                int start = interlaced ? PASS_START[pass] : 0;
-                int step  = interlaced ? PASS_STEP[pass]  : 1;
-                for (int row = start; row < ih; row += step) {
-                    for (int col = 0; col < iw; col++) {
-                        int ci = indices[src_row * iw + col];
-                        uint8_t rr = active_pal[ci][0], gg = active_pal[ci][1], bb = active_pal[ci][2];
-                        uint8_t a = (ci == transparent_idx) ? 0 : 255;
-                        out->pixels[row * iw + col] = pack_argb(a, rr, gg, bb);
-                    }
-                    src_row++;
-                }
-            }
-            kfree(indices);
-            return 0;
+        /* Disposal 2 = restore to background; 3 wants "restore previous"
+         * but we keep no canvas history, so treat it the same - clearing
+         * the sub-rect back to transparent is the closest we get. */
+        if (disposal == 2 || disposal == 3) {
+            for (int row = 0; row < ih && top + row < height; row++)
+                for (int col = 0; col < iw && left + col < width; col++)
+                    canvas[(top + row) * width + (left + col)] = 0;
         }
 
-        return -1; /* some block type we don't understand - give up */
+        /* a graphic control extension only governs the one image after it */
+        transparent_idx = -1;
+        disposal = 0;
+        delay_units = 0;
     }
-    return -1;
+
+    kfree(canvas);
+    if (out->count < 1) return -1;
+    if (out->count == 1) out->delays_ms[0] = 0; /* a still image has no delay */
+    return 0;
+}
+
+static int gif_decode(const uint8_t *data, int len, Bitmap *out)
+{
+    AnimBitmap anim;
+    if (gif_decode_frames(data, len, &anim, 1) != 0) return -1;
+    *out = anim.frames[0];
+    return 0;
 }
 
 /* jpeg_decode lives in jpeg.c; no shared header exists for it (it's only
@@ -415,4 +489,25 @@ int img_decode(const uint8_t *data, int len, Bitmap *out)
     if (data[0]==0xFF && data[1]==0xD8) return jpeg_decode(data, len, out);
     if (data[0]=='B' && data[1]=='M') return bmp_decode(data, len, out);
     return -1;
+}
+
+int img_decode_anim(const uint8_t *data, int len, AnimBitmap *out)
+{
+    if (!data || len < 4 || !out) return -1;
+    out->count = 0;
+
+    if (data[0]=='G' && data[1]=='I' && data[2]=='F')
+        return gif_decode_frames(data, len, out, ANIM_MAX_FRAMES);
+
+    if (img_decode(data, len, &out->frames[0]) != 0) return -1;
+    out->delays_ms[0] = 0;
+    out->count = 1;
+    return 0;
+}
+
+void anim_free(AnimBitmap *a)
+{
+    if (!a) return;
+    for (int i = 0; i < a->count; i++) bmp_free(&a->frames[i]);
+    a->count = 0;
 }

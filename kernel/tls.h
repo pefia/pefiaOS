@@ -1,14 +1,3 @@
-/* kernel/tls.h
- *
- * A single-connection TLS 1.3 client, just enough to get the browser onto
- * HTTPS sites: TLS_AES_128_GCM_SHA256 with X25519 for key exchange. Only
- * one connection is tracked at a time (see the globals in tls.c) - there's
- * no session pooling or renegotiation support here.
- *
- * Server certificates are not verified. We authenticate nobody; this just
- * gets bytes flowing over an encrypted channel the way a browser would
- * expect. Don't ship anything security-sensitive over it.
- */
 #ifndef PEFIA_TLS_H
 #define PEFIA_TLS_H
 
@@ -33,4 +22,4 @@ void tls_close(void);
  * in the browser UI when a connection fails. */
 const char *tls_status(void);
 
-#endif /* PEFIA_TLS_H */
+#endif

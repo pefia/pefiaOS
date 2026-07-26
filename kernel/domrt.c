@@ -1,10 +1,3 @@
-/* kernel/domrt.c - pool-backed DOM tree. Declarations in domrt.h.
- *
- * Nothing here calls kmalloc. Nodes, attributes and interned strings all come
- * out of static arrays sized generously for the pages we actually load; once
- * a pool is full further allocations just return failure and callers are
- * expected to shrug and move on (a half-built tree beats a crash).
- */
 #include "domrt.h"
 
 #define DOM_MAX_NODES   9000
@@ -171,8 +164,6 @@ void dom_set_attr(DomNode *n, const char *name, const char *val)
     pool_attrs[idx].next = n->attr_head;
     n->attr_head = idx;
 }
-
-/* --- lookups --- */
 
 DomNode *dom_get_element_by_id(const char *id)
 {

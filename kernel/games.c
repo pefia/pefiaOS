@@ -1,15 +1,3 @@
-/* kernel/games.c
- *
- * Seven games sharing one file because they share one problem: an off-screen
- * buffer sized to the window's content area, composed frame by frame and
- * flipped onto the screen with a single fb_blit(). game_tick() gets called
- * once per WM loop iteration and each game paces itself off clock_ms(), so
- * a slow loop doesn't just make things run in slow motion.
- *
- * Input is polled straight out of input.h's key-state table - arrows or WASD
- * to move, space doubles as flap/jump/hard-drop/restart depending on which
- * game currently owns the window.
- */
 #include "games.h"
 #include "wm.h"
 #include "framebuffer.h"
@@ -30,50 +18,43 @@
 
 #define MAX_MW 64
 #define MAX_MH 16
-#define TS     24          /* Mario tile size in pixels */
-#define PW     18          /* Mario player width  */
-#define PH     22          /* Mario player height */
-#define ES     20          /* Mario enemy size    */
-#define COLS   10          /* Tetris board width  */
-#define ROWS   18          /* Tetris board height */
-#define SN_MAXW 48         /* Snake grid max width  (cells) */
-#define SN_MAXH 34         /* Snake grid max height (cells) */
+#define TS     24
+#define PW     18
+#define PH     22
+#define ES     20
+#define COLS   10
+#define ROWS   18
+#define SN_MAXW 48
+#define SN_MAXH 34
 #define SN_CAP  (SN_MAXW * SN_MAXH)
-#define BK_MAXC 14         /* Breakout max brick columns */
-#define BK_MAXR 8          /* Breakout max brick rows    */
+#define BK_MAXC 14
+#define BK_MAXR 8
 
 typedef struct {
     int       kind;
     color_t  *fbuf;        /* off-screen frame, cw*ch native pixels */
-    int       cw, ch;      /* current buffer dimensions             */
+    int       cw, ch;
     int       inited;      /* game state has been reset once        */
-    uint32_t  last_ms;     /* time of last logic step               */
+    uint32_t  last_ms;
     int       over, won, score, best;
 
-    /* --- Flappy --- */
     int f_y, f_vy, f_pw, f_spacing, f_px[3], f_gap[3];
 
-    /* --- Pong --- */
     int p_lpy, p_rpy, p_bx, p_by, p_bvx, p_bvy, p_ls, p_rs, p_ph, p_pw, p_bs;
 
-    /* --- Mario --- */
     int  m_px, m_py, m_vx, m_vy, m_on, m_cam, m_lives, m_W, m_H, m_sx, m_sy;
     char m_map[MAX_MW * MAX_MH];
     int  e_x[8], e_y[8], e_vx[8], e_lo[8], e_hi[8], e_on[8], m_ne;
 
-    /* --- Raycaster --- */
     int r_px, r_py, r_ang;
 
-    /* --- Tetris --- */
     uint8_t t_board[ROWS * COLS];
     int     t_type, t_rot, t_x, t_y, t_acc, t_lines;
 
-    /* --- Snake --- */
     uint16_t s_body[SN_CAP];   /* ring buffer of cell indices (y*gw + x) */
     int      s_head, s_len, s_dir, s_pend, s_acc;
     int      s_gw, s_gh, s_food;
 
-    /* --- Breakout --- */
     uint8_t  k_brick[BK_MAXR * BK_MAXC];
     int      k_rows, k_cols, k_left, k_px, k_bx, k_by, k_bvx, k_bvy;
     int      k_lives, k_stuck;
@@ -84,7 +65,7 @@ typedef struct {
  * don't all get the same opening layout on every boot. */
 static uint32_t rng_state = 0x2545F491u;
 static int      sin_ready  = 0;
-static int      sintab[360];           /* sin(deg) scaled by 1024 */
+static int      sintab[360];
 
 static uint32_t grand(void)
 {
@@ -94,7 +75,7 @@ static uint32_t grand(void)
     return x;
 }
 
-static int grange(int lo, int hi)      /* [lo, hi) */
+static int grange(int lo, int hi)
 {
     if (hi <= lo) return lo;
     return lo + (int)(grand() % (uint32_t)(hi - lo));
@@ -108,8 +89,8 @@ static void trig_init(void)
     if (sin_ready) return;
     rng_state ^= (uint32_t)rdtsc() | 1u;
     for (int d = 0; d <= 180; d++) {
-        int xd  = d * (180 - d);                 /* 0..8100 */
-        int den = 40500 - xd;                    /* never zero on this range */
+        int xd  = d * (180 - d);
+        int den = 40500 - xd;
         sintab[d] = (4 * xd * 1024) / den;
     }
     for (int d = 181; d < 360; d++) sintab[d] = -sintab[d - 180];
@@ -284,11 +265,11 @@ static void flappy_draw(Game *g)
 
     int radius = g->cw / 26; if (radius < 8) radius = 8;
     int birdx = g->cw / 4, birdy = g->f_y >> 6;
-    gfill(g, birdx - radius, birdy - radius, 2 * radius, 2 * radius, fb_rgb(248, 216, 72));   /* body */
-    gfill(g, birdx - radius, birdy + radius - 4, 2 * radius, 4, fb_rgb(228, 170, 60));         /* belly */
-    gfill(g, birdx + radius - 6, birdy - 5, 6, 6, fb_rgb(255, 255, 255));                      /* eye white */
-    gfill(g, birdx + radius - 3, birdy - 4, 3, 3, fb_rgb(20, 20, 20));                         /* pupil */
-    gfill(g, birdx + radius, birdy + 1, 6, 4, fb_rgb(232, 132, 40));                           /* beak */
+    gfill(g, birdx - radius, birdy - radius, 2 * radius, 2 * radius, fb_rgb(248, 216, 72));
+    gfill(g, birdx - radius, birdy + radius - 4, 2 * radius, 4, fb_rgb(228, 170, 60));
+    gfill(g, birdx + radius - 6, birdy - 5, 6, 6, fb_rgb(255, 255, 255));
+    gfill(g, birdx + radius - 3, birdy - 4, 3, 3, fb_rgb(20, 20, 20));
+    gfill(g, birdx + radius, birdy + 1, 6, 4, fb_rgb(232, 132, 40));
 }
 
 static void flappy_overlay(Game *g, int cx, int cy)
@@ -442,7 +423,7 @@ static void mario_reset(Game *g)
     m_setrow(g, 6, 38, 41, '#'); m_setrow(g, 5, 38, 41, 'o');
     g->m_map[10 * g->m_W + 5] = '?';  g->m_map[10 * g->m_W + 6] = '?';
 
-    for (int r = 7; r < 12; r++) g->m_map[r * g->m_W + 57] = 'G';   /* end-of-level flagpole */
+    for (int r = 7; r < 12; r++) g->m_map[r * g->m_W + 57] = 'G';
 
     g->m_ne = 0;
     m_addenemy(g, 12); m_addenemy(g, 26); m_addenemy(g, 45);
@@ -504,7 +485,7 @@ static void mario_step(Game *g)
         if (g->m_px + PW > g->e_x[i] && g->m_px < g->e_x[i] + ES &&
             g->m_py + PH > g->e_y[i] && g->m_py < g->e_y[i] + ES) {
             if (g->m_vy > 0 && g->m_py + PH - g->m_vy <= g->e_y[i] + 8) {
-                g->e_on[i] = 0; g->score += 200; g->m_vy = -8;      /* stomp */
+                g->e_on[i] = 0; g->score += 200; g->m_vy = -8;
             } else {
                 mario_respawn(g);
                 return;
@@ -561,10 +542,10 @@ static void mario_draw(Game *g)
     }
 
     int sx = g->m_px - cam, sy = g->m_py + oy;
-    gfill(g, sx, sy, PW, PH, fb_rgb(210, 60, 50));            /* shirt */
-    gfill(g, sx, sy + PH / 2, PW, PH / 2, fb_rgb(60, 88, 200)); /* overalls */
-    gfill(g, sx + 2, sy + 2, PW - 4, 6, fb_rgb(245, 206, 170)); /* face */
-    gfill(g, sx, sy, PW, 4, fb_rgb(180, 40, 36));            /* cap */
+    gfill(g, sx, sy, PW, PH, fb_rgb(210, 60, 50));
+    gfill(g, sx, sy + PH / 2, PW, PH / 2, fb_rgb(60, 88, 200));
+    gfill(g, sx + 2, sy + 2, PW - 4, 6, fb_rgb(245, 206, 170));
+    gfill(g, sx, sy, PW, 4, fb_rgb(180, 40, 36));
 }
 
 static void mario_overlay(Game *g, int cx, int cy)
@@ -579,10 +560,6 @@ static void mario_overlay(Game *g, int cx, int cy)
     else if (g->over)
         center_msg(cx, cy, g->cw, g->ch, "GAME OVER  -  SPACE", fb_rgb(255, 220, 120), fb_rgb(120, 36, 44));
 }
-
-/* ===========================================================================
- * MAZE 3D  (raycaster)
- * ======================================================================== */
 
 static const char *RC[16] = {
     "1111111111111111",
@@ -612,7 +589,7 @@ static int rc_cell(int cx, int cy)
 
 static void raycast_reset(Game *g)
 {
-    g->r_px = 1 * 256 + 128;     /* cell (1,1) centre */
+    g->r_px = 1 * 256 + 128;
     g->r_py = 1 * 256 + 128;
     g->r_ang = 30;
     g->over = 0;
@@ -687,30 +664,26 @@ static void raycast_overlay(Game *g, int cx, int cy)
     label(cx + 8, cy + 6, "Maze 3D  -  WASD / arrows", fb_rgb(220, 230, 245), fb_rgb(20, 24, 36));
 }
 
-/* ===========================================================================
- * TETRIS
- * ======================================================================== */
-
 static const uint16_t TET[7][4] = {
-    { 0x0F00, 0x2222, 0x00F0, 0x4444 },   /* I */
-    { 0x6600, 0x6600, 0x6600, 0x6600 },   /* O */
-    { 0x4E00, 0x4640, 0x0E40, 0x4C40 },   /* T */
-    { 0x6C00, 0x4620, 0x06C0, 0x8C40 },   /* S */
-    { 0xC600, 0x2640, 0x0C60, 0x4C80 },   /* Z */
-    { 0x8E00, 0x6440, 0x0E20, 0x44C0 },   /* J */
-    { 0x2E00, 0x4460, 0x0E80, 0xC440 },   /* L */
+    { 0x0F00, 0x2222, 0x00F0, 0x4444 },
+    { 0x6600, 0x6600, 0x6600, 0x6600 },
+    { 0x4E00, 0x4640, 0x0E40, 0x4C40 },
+    { 0x6C00, 0x4620, 0x06C0, 0x8C40 },
+    { 0xC600, 0x2640, 0x0C60, 0x4C80 },
+    { 0x8E00, 0x6440, 0x0E20, 0x44C0 },
+    { 0x2E00, 0x4460, 0x0E80, 0xC440 },
 };
 
 static color_t tet_color(int t)
 {
     switch (t) {
-    case 0: return fb_rgb(80, 200, 220);   /* I cyan   */
-    case 1: return fb_rgb(228, 206, 70);   /* O yellow */
-    case 2: return fb_rgb(170, 90, 200);   /* T purple */
-    case 3: return fb_rgb(96, 200, 100);   /* S green  */
-    case 4: return fb_rgb(220, 80, 80);    /* Z red    */
-    case 5: return fb_rgb(80, 120, 220);   /* J blue   */
-    default:return fb_rgb(228, 150, 64);   /* L orange */
+    case 0: return fb_rgb(80, 200, 220);
+    case 1: return fb_rgb(228, 206, 70);
+    case 2: return fb_rgb(170, 90, 200);
+    case 3: return fb_rgb(96, 200, 100);
+    case 4: return fb_rgb(220, 80, 80);
+    case 5: return fb_rgb(80, 120, 220);
+    default:return fb_rgb(228, 150, 64);
     }
 }
 
@@ -778,7 +751,7 @@ static void tetris_step(Game *g)
         else if (tet_valid(g, g->t_type, nr, g->t_x - 1, g->t_y)) { g->t_rot = nr; g->t_x--; }
         else if (tet_valid(g, g->t_type, nr, g->t_x + 1, g->t_y)) { g->t_rot = nr; g->t_x++; }
     }
-    if (space_press()) {                                   /* hard drop */
+    if (space_press()) {
         while (tet_valid(g, g->t_type, g->t_rot, g->t_x, g->t_y + 1)) g->t_y++;
         tet_lock(g);
         return;
@@ -787,7 +760,7 @@ static void tetris_step(Game *g)
     int level = g->t_lines / 10;
     int interval = 600 - level * 45; if (interval < 90) interval = 90;
     g->t_acc += 33;
-    if (down_held()) g->t_acc += 33 * 6;                   /* soft drop */
+    if (down_held()) g->t_acc += 33 * 6;
     if (g->t_acc >= interval) {
         g->t_acc = 0;
         if (tet_valid(g, g->t_type, g->t_rot, g->t_x, g->t_y + 1)) g->t_y++;
@@ -849,7 +822,7 @@ static void tetris_overlay(Game *g, int cx, int cy)
  * window mid-game restarts the round on the new grid.
  * ======================================================================== */
 
-#define SN_CELL 16                     /* pixels per grid cell */
+#define SN_CELL 16
 
 /* directions: 0=up 1=right 2=down 3=left (opposite = dir ^ 2) */
 static const int SN_DX[4] = { 0, 1, 0, -1 };
@@ -865,7 +838,7 @@ static int snake_cell_used(Game *g, int cell)
 static void snake_place_food(Game *g)
 {
     int cells = g->s_gw * g->s_gh;
-    if (g->s_len >= cells) { g->s_food = -1; return; }   /* board full: you win */
+    if (g->s_len >= cells) { g->s_food = -1; return; }
     int c;
     do { c = grange(0, cells); } while (snake_cell_used(g, c));
     g->s_food = c;
@@ -885,7 +858,7 @@ static void snake_reset(Game *g)
     int cx = g->s_gw / 2, cy = g->s_gh / 2;
     g->s_len  = 4;
     g->s_head = 3;
-    g->s_dir  = 1;                       /* heading right */
+    g->s_dir  = 1;
     g->s_pend = 1;
     for (int i = 0; i < 4; i++)
         g->s_body[i] = (uint16_t)(cy * g->s_gw + (cx - 3 + i));
@@ -940,7 +913,7 @@ static void snake_step(Game *g)
     if (grow) {
         g->s_len++; g->score++;
         snake_place_food(g);
-        if (g->s_food < 0) {             /* filled the whole board */
+        if (g->s_food < 0) {
             g->won = 1; g->over = 1;
             if (g->score > g->best) g->best = g->score;
         }
@@ -953,18 +926,17 @@ static void snake_draw(Game *g)
     int oy = (g->ch - g->s_gh * SN_CELL) / 2;
 
     gclear(g, fb_rgb(18, 24, 18));
-    /* checkerboard field */
+
     for (int y = 0; y < g->s_gh; y++)
         for (int x = 0; x < g->s_gw; x++)
             gfill(g, ox + x * SN_CELL, oy + y * SN_CELL, SN_CELL, SN_CELL,
                   ((x + y) & 1) ? fb_rgb(38, 52, 38) : fb_rgb(32, 46, 32));
 
-    /* apple */
     if (g->s_food >= 0) {
         int fx = ox + (g->s_food % g->s_gw) * SN_CELL;
         int fy = oy + (g->s_food / g->s_gw) * SN_CELL;
         gfill(g, fx + 3, fy + 3, SN_CELL - 6, SN_CELL - 6, fb_rgb(226, 62, 54));
-        gfill(g, fx + SN_CELL / 2 - 1, fy + 1, 2, 4, fb_rgb(96, 66, 32));   /* stem */
+        gfill(g, fx + SN_CELL / 2 - 1, fy + 1, 2, 4, fb_rgb(96, 66, 32));
     }
 
     /* body, tail-to-head, shading toward the head */
@@ -974,7 +946,7 @@ static void snake_draw(Game *g)
         int sy = oy + (c / g->s_gw) * SN_CELL;
         int t  = 255 - (i * 96) / (g->s_len ? g->s_len : 1);
         gfill(g, sx + 1, sy + 1, SN_CELL - 2, SN_CELL - 2, shade(92, 220, 92, t));
-        if (i == 0) {                                     /* head: eyes */
+        if (i == 0) {
             gfill(g, sx + 4, sy + 4, 3, 3, fb_rgb(16, 16, 16));
             gfill(g, sx + SN_CELL - 7, sy + 4, 3, 3, fb_rgb(16, 16, 16));
         }
@@ -1005,15 +977,15 @@ static void snake_overlay(Game *g, int cx, int cy)
  * ball starts stuck to the paddle; space launches it. Three lives.
  * ======================================================================== */
 
-static int bk_bw(Game *g) { return (g->cw - 16) / g->k_cols; }   /* brick width  */
-#define BK_BH   18                                               /* brick height */
-#define BK_TOP  36                                               /* wall y start */
+static int bk_bw(Game *g) { return (g->cw - 16) / g->k_cols; }
+#define BK_BH   18
+#define BK_TOP  36
 
 static void breakout_stick(Game *g)
 {
     g->k_stuck = 1;
-    g->k_bx = (g->k_px << 6);            /* ride the paddle centre */
-    g->k_by = 0;                          /* recomputed while stuck */
+    g->k_bx = (g->k_px << 6);
+    g->k_by = 0;
 }
 
 static void breakout_reset(Game *g)
@@ -1039,7 +1011,7 @@ static void breakout_launch(Game *g)
 {
     int sp = g->cw / 160 + 3;
     g->k_stuck = 0;
-    g->k_bvx = ((grand() & 1) ? sp : -sp) << 5;   /* half-speed x */
+    g->k_bvx = ((grand() & 1) ? sp : -sp) << 5;
     g->k_bvy = -(sp << 6);
 }
 
@@ -1047,16 +1019,16 @@ static void breakout_step(Game *g)
 {
     if (g->over) { if (act_press()) breakout_reset(g); return; }
 
-    int pw = g->cw / 6; if (pw < 56) pw = 56;     /* paddle width  */
-    int ph = 10;                                   /* paddle height */
-    int py = g->ch - 24;                           /* paddle top y  */
+    int pw = g->cw / 6; if (pw < 56) pw = 56;
+    int ph = 10;
+    int py = g->ch - 24;
     int sp = g->cw / 90 + 4;
     if (left_held())  g->k_px -= sp;
     if (right_held()) g->k_px += sp;
     if (g->k_px < pw / 2)          g->k_px = pw / 2;
     if (g->k_px > g->cw - pw / 2)  g->k_px = g->cw - pw / 2;
 
-    int r = 5;                                     /* ball radius */
+    int r = 5;
     if (g->k_stuck) {
         g->k_bx = g->k_px << 6;
         g->k_by = (py - r - 1) << 6;
@@ -1068,7 +1040,6 @@ static void breakout_step(Game *g)
     g->k_by += g->k_bvy;
     int bx = g->k_bx >> 6, by = g->k_by >> 6;
 
-    /* walls */
     if (bx - r < 0)        { g->k_bx = (r)        << 6; g->k_bvx = -g->k_bvx; }
     if (bx + r >= g->cw)   { g->k_bx = (g->cw - r - 1) << 6; g->k_bvx = -g->k_bvx; }
     if (by - r < 0)        { g->k_by = (r)        << 6; g->k_bvy = -g->k_bvy; }
@@ -1077,7 +1048,7 @@ static void breakout_step(Game *g)
     bx = g->k_bx >> 6; by = g->k_by >> 6;
     if (g->k_bvy > 0 && by + r >= py && by + r < py + ph &&
         bx >= g->k_px - pw / 2 - r && bx <= g->k_px + pw / 2 + r) {
-        int off = bx - g->k_px;                    /* -pw/2 .. +pw/2 */
+        int off = bx - g->k_px;
         g->k_bvy = -g->k_bvy;
         g->k_bvx = (off << 6) / (pw / 6);
         g->k_by  = (py - r - 1) << 6;
@@ -1101,7 +1072,6 @@ static void breakout_step(Game *g)
         }
     }
 
-    /* floor: lose a life */
     if (by - r > g->ch) {
         if (--g->k_lives <= 0) {
             g->over = 1;
@@ -1128,7 +1098,7 @@ static void breakout_draw(Game *g)
             const uint8_t *rc = ROWC[(v - 1) % 6];
             int x = 8 + c * bw, y = BK_TOP + row * BK_BH;
             gfill(g, x + 1, y + 1, bw - 2, BK_BH - 2, fb_rgb(rc[0], rc[1], rc[2]));
-            gfill(g, x + 1, y + 1, bw - 2, 3, shade(rc[0], rc[1], rc[2], 160)); /* bevel */
+            gfill(g, x + 1, y + 1, bw - 2, 3, shade(rc[0], rc[1], rc[2], 160));
         }
 
     int pw = g->cw / 6; if (pw < 56) pw = 56;
@@ -1160,10 +1130,6 @@ static void breakout_overlay(Game *g, int cx, int cy)
                    fb_rgb(220, 230, 250), fb_rgb(40, 48, 76));
     }
 }
-
-/* ===========================================================================
- * Dispatch + lifecycle
- * ======================================================================== */
 
 static void game_reset(Game *g)
 {
@@ -1304,7 +1270,7 @@ void game_paint(Window *w, int cx, int cy, int cw, int ch)
     Game *g = (Game *)w->state;
     if (!g) return;
     if (!ensure_buf(g, cw, ch)) { fb_fill_rect(cx, cy, cw, ch, fb_rgb(0, 0, 0)); return; }
-    present_raw(g, cx, cy);                 /* inside wm_paint's mouse bracket */
+    present_raw(g, cx, cy);
 }
 
 void game_tick(Window *w, int cx, int cy, int cw, int ch)
@@ -1318,7 +1284,7 @@ void game_tick(Window *w, int cx, int cy, int cw, int ch)
     if (g->last_ms == 0) g->last_ms = now;
     if (now - g->last_ms < step) return;
     g->last_ms += step;
-    if (now - g->last_ms > step * 4) g->last_ms = now;   /* don't spiral if behind */
+    if (now - g->last_ms > step * 4) g->last_ms = now;
 
     game_advance(g);
     present(g, cx, cy);

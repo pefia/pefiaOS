@@ -29,7 +29,7 @@ void clock_init(void)
     uint64_t t_end = rdtsc();
 
     uint64_t cycles_per_sec = t_end - t_start;
-    if (cycles_per_sec < 1000) cycles_per_sec = 1000000000ULL;  /* nonsense reading, assume ~1GHz */
+    if (cycles_per_sec < 1000) cycles_per_sec = 1000000000ULL;
     tsc_cycles_per_ms = cycles_per_sec / 1000;
     if (tsc_cycles_per_ms == 0) tsc_cycles_per_ms = 1;
 

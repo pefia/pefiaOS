@@ -1,19 +1,8 @@
-/* kernel/crypto.h
- *
- * The crypto primitives needed to speak TLS 1.3 to a real web server:
- * SHA-256, HMAC/HKDF on top of it, AES-128-GCM, and X25519.
- *
- * None of this is hardened. No constant-time guarantees, no side-channel
- * hygiene, no attempt to zero secrets after use. It's here so the browser
- * can fetch pages over HTTPS, not to keep anyone's keys safe from a
- * determined attacker with a cache-timing rig. Treat it accordingly.
- */
 #ifndef PEFIA_CRYPTO_H
 #define PEFIA_CRYPTO_H
 
 #include <stdint.h>
 
-/* SHA-256 */
 typedef struct {
     uint32_t h[8];
     uint64_t total;
@@ -57,4 +46,4 @@ void x25519_base(uint8_t out[32], const uint8_t scalar[32]);
  * X25519 scalars on a machine with nothing better to draw entropy from. */
 void rng_bytes(uint8_t *out, int n);
 
-#endif /* PEFIA_CRYPTO_H */
+#endif

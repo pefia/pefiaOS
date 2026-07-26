@@ -1,22 +1,19 @@
-/* First-fit free-list allocator. Blocks sit back-to-back in memory with a
- * small header in front of each one, so we can walk the whole heap just by
- * following addresses - no separate bookkeeping structure needed. kmalloc
- * grabs the first free block that fits and splits off the leftover; kfree
- * just flips a flag and then coalesces neighboring free blocks so we don't
- * end up fragmented into dust after a while. */
 #include "heap.h"
 #include "multiboot.h"
 #include "util.h"
 
 #define HEAP_ALIGN 8
 
-extern uint8_t _kernel_end;     /* from linker.ld */
+extern uint8_t _kernel_end;
 
 typedef struct block {
     size_t        size;   /* payload bytes, not counting this header */
     struct block *next;   /* next block by address (NULL at the tail) */
-    int           free;   /* 1 = available, 0 = handed out */
+    int           free;
+    uint32_t      magic;  /* HEAP_MAGIC; lets kfree reject pointers we never handed out */
 } block_t;
+
+#define HEAP_MAGIC 0x48454150u
 
 /* Header size rounded up so every returned payload is 8-byte aligned. */
 #define HDR (((sizeof(block_t) + HEAP_ALIGN - 1) / HEAP_ALIGN) * HEAP_ALIGN)
@@ -35,6 +32,7 @@ void heap_init(uintptr_t start, size_t size)
     heap_head->size = size - HDR;
     heap_head->next = NULL;
     heap_head->free = 1;
+    heap_head->magic = HEAP_MAGIC;
     heap_size_bytes = size;
 }
 
@@ -59,7 +57,7 @@ void heap_init_from_multiboot(struct multiboot_info *mb)
                 uint64_t  end64 = e->addr + e->len;
                 if (end64 > 0x100000000ULL) end64 = 0x100000000ULL;
                 uintptr_t end   = (uintptr_t)end64;
-                uintptr_t start = (base > kernel_top) ? base : kernel_top;  /* never eat into the kernel */
+                uintptr_t start = (base > kernel_top) ? base : kernel_top;
                 if (end > start && (end - start) > region_size) {
                     region_size  = end - start;
                     region_start = start;
@@ -94,6 +92,7 @@ void *kmalloc(size_t n)
             block_t *rest = (block_t *)((uint8_t *)b + HDR + n);
             rest->size = b->size - n - HDR;
             rest->free = 1;
+            rest->magic = HEAP_MAGIC;
             rest->next = b->next;
             b->next  = rest;
             b->size  = n;
@@ -101,13 +100,25 @@ void *kmalloc(size_t n)
         b->free = 0;
         return (uint8_t *)b + HDR;
     }
-    return NULL;   /* heap's full */
+    return NULL;
 }
 
 void kfree(void *p)
 {
     if (!p) return;
+
+    /* A bogus or double-freed pointer must not reach the coalescing pass
+     * below - it rewrites headers across the whole heap, so one bad free
+     * would surface as an unrelated crash much later. Bounds first (so we
+     * never read a header outside the heap), then the magic/free check. */
+    uint8_t *heap_lo = (uint8_t *)heap_head;
+    if (!heap_head ||
+        (uint8_t *)p < heap_lo + HDR ||
+        (uint8_t *)p >= heap_lo + heap_size_bytes)
+        return;
     block_t *blk = (block_t *)((uint8_t *)p - HDR);
+    if (blk->magic != HEAP_MAGIC || blk->free)
+        return;
     blk->free = 1;
 
     /* Coalesce every run of adjacent free blocks in one pass. This is

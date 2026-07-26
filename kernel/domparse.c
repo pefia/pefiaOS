@@ -1,13 +1,3 @@
-/* kernel/domparse.c - a small, forgiving HTML-to-DOM builder.
- *
- * This is not a spec-compliant tree constructor (no adoption agency
- * algorithm, no foster parenting, none of that). It handles what real pages
- * actually throw at it: quoted/unquoted/boolean attributes, void elements,
- * <script>/<style> bodies treated as raw text, comments and doctypes, and a
- * pragmatic subset of implicit tag closing so a page full of unclosed <p>
- * and <li> tags still ends up as a sane tree instead of one long chain of
- * nesting.
- */
 #include "domparse.h"
 
 static char to_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
@@ -135,7 +125,7 @@ static void parse_attributes(DomNode *n, const char *s, int len)
             decode_attr_entities(raw, vl, decoded, sizeof(decoded));
             dom_set_attr(n, name, decoded);
         } else {
-            dom_set_attr(n, name, "");     /* bare/boolean attribute */
+            dom_set_attr(n, name, "");
         }
     }
 }
@@ -167,8 +157,18 @@ static void build(BuildStack *st, const char *p, int n)
             continue;
         }
 
+        /* Find the closing '>' of the tag, but not one hiding inside a quoted
+         * attribute value - <div title="a > b"> ends at the real '>', not the
+         * one in the title. */
         int tag_start = i + 1, tag_end = tag_start;
-        while (tag_end < n && p[tag_end] != '>') tag_end++;
+        char in_quote = 0;
+        while (tag_end < n) {
+            char c = p[tag_end];
+            if (in_quote) { if (c == in_quote) in_quote = 0; }
+            else if (c == '"' || c == '\'') in_quote = c;
+            else if (c == '>') break;
+            tag_end++;
+        }
         int tag_len = tag_end - tag_start;
         const char *tag_bytes = p + tag_start;
         i = (tag_end < n) ? tag_end + 1 : n;

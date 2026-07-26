@@ -1,8 +1,3 @@
-/* kernel/shell.c
- * The console-mode shell that used to be the whole UI before the desktop
- * existed. Built-ins: help, about (neofetch knockoff), memtest, free, uptime,
- * history, ver, clear, echo.
- */
 #include "shell.h"
 #include "console.h"
 #include "framebuffer.h"
@@ -168,7 +163,7 @@ static void cmd_memtest(void)
 
     size_t after = heap_free_bytes();
     print_byte_count("heap free after:  ", after);
-    if (after != before) passed = 0;   /* leak or a coalescing bug */
+    if (after != before) passed = 0;
 
     con_setcolor(passed ? fb_rgb(120, 230, 120) : fb_rgb(255, 120, 120), shell_bg);
     con_write(passed ? "memtest: PASS\n" : "memtest: FAIL\n");
@@ -267,6 +262,7 @@ static void read_line(char *line)
         char c = (char)input_getchar();
         if (c == '\n') { con_putchar('\n'); break; }
         else if (c == '\b') { if (len > 0) { len--; con_putchar('\b'); } }
+        else if ((unsigned char)c >= 0x80) { }   /* KEY_* codes (arrows) - nothing to edit here */
         else if (len < LINE_MAX - 1) { line[len++] = c; con_putchar(c); }
     }
     line[len] = '\0';
@@ -289,7 +285,7 @@ void shell_run(void)
         history_record(line);
 
         if (line[0] == '\0') {
-            /* nothing typed, just re-prompt */
+
         } else if (str_eq(line, "help")) {
             cmd_help();
         } else if (str_eq(line, "about")) {

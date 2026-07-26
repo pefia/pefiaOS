@@ -5,8 +5,6 @@
 #include "clock.h"
 #include "inflate.h"
 
-/* --- string helpers, freestanding-safe --- */
-
 static int str_eq(const char *a, const char *b)
 {
     int i = 0;
@@ -39,10 +37,8 @@ static int starts_with_ci(const char *s, const char *prefix)
     return 1;
 }
 
-/* --- module state --- */
-
-#define RAW_CAP 262144
-#define DEC_CAP 786432   /* decompressed body scratch space - gzip can expand a lot */
+#define RAW_CAP 655360
+#define DEC_CAP 1048576   /* decompressed body scratch space - gzip can expand a lot */
 
 static int     net_link_up = 0;
 static char    net_status_msg[80];
@@ -50,6 +46,79 @@ static uint8_t raw_buf[RAW_CAP];
 static uint8_t dec_buf[DEC_CAP];
 
 static void set_status(const char *s) { str_copy(net_status_msg, s, sizeof(net_status_msg)); }
+
+/* Just enough cookie support to keep a session alive across redirects.
+ * Keyed by (host, name); Path/Expires/Domain attributes are ignored.
+ * Pragmatic, not RFC 6265. */
+#define COOKIE_MAX 24
+
+typedef struct {
+    char host[96];   /* stored with any leading "www." stripped */
+    char name[64];
+    char val[256];
+    int  used;
+} Cookie;
+
+static Cookie cookie_jar[COOKIE_MAX];
+
+static const char *strip_www(const char *host)
+{
+    return starts_with_ci(host, "www.") ? host + 4 : host;
+}
+
+/* A cookie stored for "example.com" also applies to "www.example.com":
+ * exact match, or the request host ends with "." + the stored host. */
+static int cookie_host_match(const char *req_host, const char *stored)
+{
+    if (str_eq_ci(req_host, stored)) return 1;
+    int rl = str_len(req_host), sl = str_len(stored);
+    if (rl <= sl || req_host[rl - sl - 1] != '.') return 0;
+    for (int i = 0; i < sl; i++)
+        if (to_lower(req_host[rl - sl + i]) != to_lower(stored[i])) return 0;
+    return 1;
+}
+
+static void cookie_store(const char *req_host, const char *name, const char *val)
+{
+    const char *host = strip_www(req_host);
+
+    int slot = -1;
+    for (int i = 0; i < COOKIE_MAX; i++) {
+        if (cookie_jar[i].used && str_eq_ci(cookie_jar[i].host, host) &&
+            str_eq(cookie_jar[i].name, name)) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < COOKIE_MAX; i++)
+            if (!cookie_jar[i].used) { slot = i; break; }
+    }
+    if (slot < 0) slot = 0;   /* jar full - recycle slot 0 rather than get clever */
+
+    str_copy(cookie_jar[slot].host, host, sizeof(cookie_jar[slot].host));
+    str_copy(cookie_jar[slot].name, name, sizeof(cookie_jar[slot].name));
+    str_copy(cookie_jar[slot].val,  val,  sizeof(cookie_jar[slot].val));
+    cookie_jar[slot].used = 1;
+}
+
+/* Builds "Cookie: n1=v1; n2=v2\r\n" from every jar entry that applies to
+ * this host; leaves out empty if nothing matches. Never overflows - an
+ * entry that doesn't fit is simply dropped. */
+static void cookies_for_host(const char *host, char *out, int cap)
+{
+    int o = 0, any = 0;
+    for (int i = 0; i < COOKIE_MAX; i++) {
+        if (!cookie_jar[i].used || !cookie_host_match(host, cookie_jar[i].host)) continue;
+        const char *pre = any ? "; " : "Cookie: ";
+        int need = str_len(pre) + str_len(cookie_jar[i].name) + 1 + str_len(cookie_jar[i].val);
+        if (o + need > cap - 3) break;   /* keep room for the closing CRLF + NUL */
+        for (int j = 0; pre[j]; j++) out[o++] = pre[j];
+        for (int j = 0; cookie_jar[i].name[j]; j++) out[o++] = cookie_jar[i].name[j];
+        out[o++] = '=';
+        for (int j = 0; cookie_jar[i].val[j]; j++) out[o++] = cookie_jar[i].val[j];
+        any = 1;
+    }
+    if (any) { out[o++] = '\r'; out[o++] = '\n'; }
+    out[o] = '\0';
+}
 
 int net_init(void)
 {
@@ -87,8 +156,6 @@ int net_init(void)
 int net_ready(void) { return net_link_up; }
 const char *net_status_text(void) { return net_status_msg; }
 uint32_t net_local_ip(void) { return netstack_local_ip(); }
-
-/* --- URL parsing --- */
 
 typedef struct {
     char scheme[8];
@@ -157,13 +224,11 @@ static void resolve_location(const Url *base, const char *loc, char *out, int ca
     out[o] = '\0';
 }
 
-/* --- HTTP response parsing --- */
-
 static int find_header_end(const uint8_t *b, int len)
 {
     for (int i = 0; i + 3 < len; i++)
         if (b[i] == '\r' && b[i+1] == '\n' && b[i+2] == '\r' && b[i+3] == '\n') return i;
-    for (int i = 0; i + 1 < len; i++)   /* tolerate a bare double-LF */
+    for (int i = 0; i + 1 < len; i++)
         if (b[i] == '\n' && b[i+1] == '\n') return i;
     return -1;
 }
@@ -178,12 +243,17 @@ static int parse_status_line(const uint8_t *b, int len)
     return digits ? code : -1;
 }
 
-static int find_header(const uint8_t *b, int hlen, const char *name, char *out, int cap)
+/* Like find_header below, but starts scanning at byte offset `from` and
+ * returns the offset just past the matched line, so callers can walk
+ * repeated headers (Set-Cookie, mostly). Returns -1 when no more match. */
+static int find_header_from(const uint8_t *b, int hlen, const char *name, int from, char *out, int cap)
 {
     int name_len = str_len(name);
-    int i = 0;
-    while (i < hlen && b[i] != '\n') i++;   /* skip the status line */
-    i++;
+    int i = from;
+    if (i == 0) {
+        while (i < hlen && b[i] != '\n') i++;
+        i++;
+    }
 
     while (i < hlen) {
         int matches = 1;
@@ -196,13 +266,38 @@ static int find_header(const uint8_t *b, int hlen, const char *name, char *out, 
             int o = 0;
             while (k < hlen && b[k] != '\r' && b[k] != '\n' && o < cap - 1) out[o++] = b[k++];
             out[o] = '\0';
-            return 1;
+            while (k < hlen && b[k] != '\n') k++;
+            return k + 1;
         }
         while (i < hlen && b[i] != '\n') i++;
         i++;
     }
     out[0] = '\0';
-    return 0;
+    return -1;
+}
+
+static int find_header(const uint8_t *b, int hlen, const char *name, char *out, int cap)
+{
+    return find_header_from(b, hlen, name, 0, out, cap) >= 0;
+}
+
+/* Servers happily send several Set-Cookie headers per response and
+ * find_header only ever sees the first - so walk them all. Only the
+ * name=value part before the first ';' is kept; attributes are ignored. */
+static void cookies_from_response(const uint8_t *b, int hlen, const char *req_host)
+{
+    char line[336];   /* enough for a max-size name=value pair */
+    int off = 0;
+    while ((off = find_header_from(b, hlen, "set-cookie", off, line, sizeof(line))) >= 0) {
+        int end = 0;
+        while (line[end] && line[end] != ';') end++;
+        line[end] = '\0';
+        int eq = 0;
+        while (line[eq] && line[eq] != '=') eq++;
+        if (eq == 0 || !line[eq]) continue;
+        line[eq] = '\0';
+        cookie_store(req_host, line, line + eq + 1);
+    }
 }
 
 /* Un-chunks Transfer-Encoding: chunked in place; returns the decoded length. */
@@ -218,22 +313,23 @@ static int dechunk(uint8_t *b, int len)
             else if (c >= 'a' && c <= 'f') digit = 10 + (c - 'a');
             else if (c >= 'A' && c <= 'F') digit = 10 + (c - 'A');
             else break;
-            size = size * 16 + digit;
+            /* Clamp instead of accumulating: the size comes from the server,
+             * and an unbounded "7FFFFFFF..." would overflow the int and turn
+             * the bounds check below into a wild copy past the buffer. */
+            if (size <= len) size = size * 16 + digit;
             saw_digit = 1;
             in++;
         }
         while (in < len && b[in] != '\n') in++;   /* skip rest of the size line */
         in++;
-        if (!saw_digit || size == 0) break;
-        if (in + size > len) size = len - in;
+        if (!saw_digit || size <= 0 || in >= len) break;
+        if (size > len - in) size = len - in;     /* len - in can't overflow: both are valid indices */
         for (int k = 0; k < size; k++) b[out++] = b[in++];
         if (in < len && b[in] == '\r') in++;
         if (in < len && b[in] == '\n') in++;
     }
     return out;
 }
-
-/* --- one HTTP(S) round trip --- */
 
 static int recv_until_done(int is_tls, int body_cap)
 {
@@ -269,7 +365,8 @@ static int recv_until_done(int is_tls, int body_cap)
     return total;
 }
 
-static int do_request(const Url *u, NetResponse *resp, char *location_out, int location_cap, int body_cap)
+static int do_request(const Url *u, int is_post, const char *post_body, NetResponse *resp,
+                      char *location_out, int location_cap, int body_cap)
 {
     uint32_t ip;
     if (dns_resolve(u->host, &ip) != 0) {
@@ -301,16 +398,41 @@ static int do_request(const Url *u, NetResponse *resp, char *location_out, int l
         }
     }
 
-    char req[1800];
+    /* Worst case fits: path 1535 + host 127 + fixed headers + cookies 1023
+     * leaves over 1k of room for a POST body; anything beyond that gets
+     * truncated below rather than overflowing. */
+    char req[4096];
+    char cookie_hdr[1024];
+    cookies_for_host(u->host, cookie_hdr, sizeof(cookie_hdr));
+
     int o = 0;
-    const char *line1 = "GET ";
+    const char *line1 = is_post ? "POST " : "GET ";
     for (int i = 0; line1[i]; i++) req[o++] = line1[i];
     for (int i = 0; u->path[i]; i++) req[o++] = u->path[i];
     const char *line2 = " HTTP/1.1\r\nHost: ";
     for (int i = 0; line2[i]; i++) req[o++] = line2[i];
     for (int i = 0; u->host[i]; i++) req[o++] = u->host[i];
-    const char *rest = "\r\nUser-Agent: pefiaOS/1.0 (browser)\r\nAccept: text/html,image/png,image/jpeg,image/gif,*/*\r\nAccept-Encoding: gzip, identity\r\nConnection: close\r\n\r\n";
+    const char *rest = "\r\nUser-Agent: Mozilla/5.0 (compatible; pefiaOS/1.0)\r\nAccept: text/html,image/png,image/jpeg,image/gif,*/*\r\nAccept-Language: en-US,en;q=0.8\r\nAccept-Encoding: gzip, identity\r\nConnection: close\r\n";
     for (int i = 0; rest[i]; i++) req[o++] = rest[i];
+    for (int i = 0; cookie_hdr[i]; i++) req[o++] = cookie_hdr[i];
+
+    if (is_post) {
+        const char *ct = "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: ";
+        for (int i = 0; ct[i]; i++) req[o++] = ct[i];
+        int blen = post_body ? str_len(post_body) : 0;
+        int room = (int)sizeof(req) - o - 10;
+        if (room < 0) room = 0;
+        if (blen > room) blen = room;
+        char digits[8];
+        int v = blen, n = 0;
+        if (v == 0) digits[n++] = '0';
+        else while (v) { digits[n++] = (char)('0' + v % 10); v /= 10; }
+        while (n) req[o++] = digits[--n];
+        req[o++] = '\r'; req[o++] = '\n'; req[o++] = '\r'; req[o++] = '\n';
+        for (int i = 0; i < blen; i++) req[o++] = post_body[i];
+    } else {
+        req[o++] = '\r'; req[o++] = '\n';
+    }
 
     int sent = is_tls ? tls_send((const uint8_t *)req, o) : tcp_send((const uint8_t *)req, o);
     if (sent < 0) {
@@ -332,6 +454,8 @@ static int do_request(const Url *u, NetResponse *resp, char *location_out, int l
     int header_len = (header_end >= 0) ? header_end : total;
 
     resp->status = parse_status_line(raw_buf, total);
+
+    cookies_from_response(raw_buf, header_len, u->host);
 
     char transfer_encoding[64];
     find_header(raw_buf, header_len, "transfer-encoding", transfer_encoding, sizeof(transfer_encoding));
@@ -368,10 +492,10 @@ static int do_request(const Url *u, NetResponse *resp, char *location_out, int l
     return 0;
 }
 
-/* Shared by net_fetch and net_fetch_limited - the only difference between
- * them is whether the body read is capped, so both just forward here with
- * cap = 0 meaning "no limit". */
-static int fetch_with_cap(const char *url, int cap, NetResponse *resp)
+/* Shared by net_fetch, net_fetch_limited and net_fetch_post - the only
+ * differences are whether the body read is capped (cap = 0 means "no
+ * limit") and whether we start out as a POST (post_body non-NULL). */
+static int fetch_with_cap(const char *url, int cap, const char *post_body, NetResponse *resp)
 {
     if (!net_link_up) {
         set_status("Network offline");
@@ -382,14 +506,15 @@ static int fetch_with_cap(const char *url, int cap, NetResponse *resp)
         return -1;
     }
 
-    char current[256];
+    char current[512];
     str_copy(current, url, sizeof(current));
     Url u;
+    const char *body = post_body;   /* non-NULL means this hop is a POST */
 
     for (int hop = 0; hop < 6; hop++) {
-        char location[256] = { 0 };
+        char location[512] = { 0 };
         parse_url(current, &u);
-        int r = do_request(&u, resp, location, sizeof(location), cap);
+        int r = do_request(&u, body != 0, body, resp, location, sizeof(location), cap);
         str_copy(resp->final_url, current, sizeof(resp->final_url));
         if (r < 0) return r;
 
@@ -397,9 +522,11 @@ static int fetch_with_cap(const char *url, int cap, NetResponse *resp)
         int is_redirect = (status == 301 || status == 302 || status == 303 ||
                             status == 307 || status == 308);
         if (is_redirect && location[0]) {
-            char next[256];
+            char next[512];
             resolve_location(&u, location, next, sizeof(next));
             str_copy(current, next, sizeof(current));
+            if (body && status != 307 && status != 308)
+                body = 0;   /* 301/302/303 downgrade the POST to a GET */
             set_status("Following redirect");
             continue;
         }
@@ -412,10 +539,15 @@ static int fetch_with_cap(const char *url, int cap, NetResponse *resp)
 
 int net_fetch(const char *url, NetResponse *resp)
 {
-    return fetch_with_cap(url, 0, resp);
+    return fetch_with_cap(url, 0, 0, resp);
 }
 
 int net_fetch_limited(const char *url, int max_body_bytes, NetResponse *resp)
 {
-    return fetch_with_cap(url, max_body_bytes > 0 ? max_body_bytes : 0, resp);
+    return fetch_with_cap(url, max_body_bytes > 0 ? max_body_bytes : 0, 0, resp);
+}
+
+int net_fetch_post(const char *url, const char *body, NetResponse *resp)
+{
+    return fetch_with_cap(url, 0, body ? body : "", resp);
 }

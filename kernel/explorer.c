@@ -1,8 +1,3 @@
-/* Folder listing rendered into a window, with clicks handled directly here
- * rather than through some generic widget system - ".." goes up a level, a
- * folder navigates into it, a file pops open an info window with its
- * contents. Each window tracks its own current directory (w->cwd) and
- * selected row (w->sel), so multiple explorer windows browse independently. */
 #include "explorer.h"
 #include "wm.h"
 #include "vfs.h"
@@ -11,6 +6,21 @@
 
 #define HDR_H 24
 #define ROW_H 18
+
+/* Images open in an info popup; everything else opens in the code editor. */
+static int name_is_image(const char *name)
+{
+    int n = 0; while (name[n]) n++;
+    const char *exts[] = { ".bmp", ".jpg", ".jpeg", ".png", ".gif", 0 };
+    for (int e = 0; exts[e]; e++) {
+        int m = 0; while (exts[e][m]) m++;
+        if (n >= m) {
+            int i = 0; while (i < m && name[n - m + i] == exts[e][i]) i++;
+            if (i == m) return 1;
+        }
+    }
+    return 0;
+}
 
 /* Builds the row order shown on screen: an optional ".." row, then dirs,
  * then files. Each slot in `entries` holds a vfs node index, or -1 for
@@ -92,9 +102,11 @@ void explorer_click(Window *w, int lx, int ly)
     if (!node) return;
     if (node->is_dir) {
         w->cwd = target; w->sel = -1;
-    } else {
+    } else if (name_is_image(node->name)) {
         wm_create_info(w->x + 34, w->y + 40, 320, 170,
                        node->name, node->content ? node->content : "(empty)");
+    } else {
+        wm_create_editor(w->x + 34, w->y + 30, 460, 360, w->cwd, target);
     }
 }
 

@@ -7,10 +7,6 @@ static void bcopy_(void *d, const void *s, int n) { uint8_t *a = d; const uint8_
 static void bzero_(void *d, int c, int n) { uint8_t *a = d; for (int i = 0; i < n; i++) a[i] = (uint8_t)c; }
 static int  slen_(const char *s) { int n = 0; while (s[n]) n++; return n; }
 
-/* ---------------------------------------------------------------------
- * SHA-256 (FIPS 180-4)
- * --------------------------------------------------------------------- */
-
 /* fractional bits of cube roots of the first 64 primes - standard table,
  * do not touch. */
 static const uint32_t K256[64] = {
@@ -159,10 +155,6 @@ void hkdf_expand_label(const uint8_t secret[32], const char *label,
     hkdf_expand(secret, info, n, out, outlen);
 }
 
-/* ---------------------------------------------------------------------
- * AES-128
- * --------------------------------------------------------------------- */
-
 static const uint8_t SBOX[256] = {
 0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
 0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -244,10 +236,6 @@ void aes128_encrypt(const aes128_ctx *c, const uint8_t in[16], uint8_t out[16])
     }
     bcopy_(out, state, 16);
 }
-
-/* ---------------------------------------------------------------------
- * AES-128-GCM
- * --------------------------------------------------------------------- */
 
 /* Multiplies X by H in GF(2^128) using the reduction polynomial from
  * NIST SP 800-38D (bit-by-bit shift-and-reduce - not remotely
@@ -362,7 +350,7 @@ int aesgcm_open(const uint8_t key[16], const uint8_t nonce[12],
 
 typedef long long i64;
 typedef i64 gf[16];                 /* field element: 16 limbs, 16 bits each */
-static const gf _121665 = {0xDB41, 1};   /* the curve constant (a-2)/4 */
+static const gf _121665 = {0xDB41, 1};
 
 /* Carry propagation across the 16 limbs, with the final limb folded back
  * around mod 2^255-19 (the "* 37" term is 19*2 from the doubled carry-out
@@ -405,7 +393,7 @@ static void pack25519(uint8_t *o, const gf n)
 static void unpack25519(gf o, const uint8_t *n)
 {
     for (int i = 0; i < 16; i++) o[i] = n[2*i] + ((i64)n[2*i+1] << 8);
-    o[15] &= 0x7fff;    /* clamp to 255 bits */
+    o[15] &= 0x7fff;
 }
 
 static void A(gf o, const gf a, const gf b) { for (int i = 0; i < 16; i++) o[i] = a[i] + b[i]; }
@@ -473,7 +461,7 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32])
 
 void x25519_base(uint8_t out[32], const uint8_t scalar[32])
 {
-    uint8_t base[32]; bzero_(base, 0, 32); base[0] = 9;   /* the standard Curve25519 base point */
+    uint8_t base[32]; bzero_(base, 0, 32); base[0] = 9;
     x25519(out, scalar, base);
 }
 

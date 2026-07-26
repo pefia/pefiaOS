@@ -1,4 +1,3 @@
-/* kernel/domparse.h - turn an HTML byte stream into a DOM tree. */
 #ifndef PEFIA_DOMPARSE_H
 #define PEFIA_DOMPARSE_H
 
@@ -14,4 +13,4 @@ void     dom_parse_fragment(DomNode *parent, const char *html, int len);
 /* Parses a fragment and appends its nodes to `parent` (document.write). */
 void     dom_parse_append(DomNode *parent, const char *html, int len);
 
-#endif /* PEFIA_DOMPARSE_H */
+#endif

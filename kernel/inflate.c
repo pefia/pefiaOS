@@ -209,7 +209,7 @@ static int dynamic_huffman_block(Reader *r)
         if (sym < 16) {
             lengths[n++] = (uint8_t)sym;
         } else if (sym == 16) {
-            if (n == 0) return -1;             /* nothing previous to repeat */
+            if (n == 0) return -1;
             int rep = next_bits(r, 2);
             if (rep < 0) return -1;
             fill_run(lengths, &n, total, rep + 3, lengths[n - 1]);
@@ -264,7 +264,7 @@ int inflate_raw(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
             case 0:  status = stored_block(&r); break;
             case 1:  status = fixed_huffman_block(&r); break;
             case 2:  status = dynamic_huffman_block(&r); break;
-            default: return -1;                /* type 3 is reserved/invalid */
+            default: return -1;
         }
         if (status < 0) return -1;
     } while (!final_block);
@@ -275,11 +275,11 @@ int inflate_raw(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 int zlib_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 {
     if (srclen < 2) return -1;
-    if ((src[0] & 0x0F) != 8) return -1;               /* CM: must be deflate */
-    if (((src[0] << 8) | src[1]) % 31 != 0) return -1; /* header checksum */
+    if ((src[0] & 0x0F) != 8) return -1;
+    if (((src[0] << 8) | src[1]) % 31 != 0) return -1;
 
     int header_len = 2;
-    if (src[1] & 0x20) header_len += 4;                /* preset dictionary present */
+    if (src[1] & 0x20) header_len += 4;
     return inflate_raw(src + header_len, srclen - header_len, dst, dstcap);
 }
 
@@ -290,14 +290,14 @@ int gzip_inflate(const uint8_t *src, int srclen, uint8_t *dst, int dstcap)
 
     int flags = src[3];
     int pos = 10;
-    if (flags & 0x04) {                                /* FEXTRA */
+    if (flags & 0x04) {
         if (pos + 2 > srclen) return -1;
         int xlen = src[pos] | (src[pos + 1] << 8);
         pos += 2 + xlen;
     }
-    if (flags & 0x08) { while (pos < srclen && src[pos]) pos++; pos++; }  /* FNAME */
-    if (flags & 0x10) { while (pos < srclen && src[pos]) pos++; pos++; }  /* FCOMMENT */
-    if (flags & 0x02) pos += 2;                        /* FHCRC */
+    if (flags & 0x08) { while (pos < srclen && src[pos]) pos++; pos++; }
+    if (flags & 0x10) { while (pos < srclen && src[pos]) pos++; pos++; }
+    if (flags & 0x02) pos += 2;
     if (pos >= srclen) return -1;
     return inflate_raw(src + pos, srclen - pos, dst, dstcap);
 }

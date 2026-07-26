@@ -1,9 +1,3 @@
-/* kernel/taskbar.c
- * Desktop chrome: the bottom bar (Start button, one button per open window,
- * a network indicator, live clock) plus a Start menu whose search box filters
- * both the app list and the VFS. Launches Explorer, Terminal, and Notepad
- * directly; everything else goes through wm_create_game / wm_create_doom.
- */
 #include "taskbar.h"
 #include "wm.h"
 #include "explorer.h"
@@ -13,29 +7,61 @@
 #include "console.h"
 #include "net.h"
 #include "games.h"
+#include "interp.h"
+#include "theme.h"
 
 #define BAR_H    40
 #define START_W  92
 #define NET_W    120
 #define MENU_W   300
-#define MENU_H   400
+#define MENU_H   452
 #define BTN_W    156
 #define BTN_GAP  4
+
+#define MENU_ROW_H   24
+#define MENU_LIST_TOP 76          /* list top, offset from the menu's top edge */
+#define MENU_ARROW_W  16          /* scroll arrow column (shown only when needed) */
 
 static int  menu_open = 0;
 static char search_text[40];
 static int  search_len = 0;
+static int  menu_scroll = 0;
+
+/* List geometry shared by draw + click so they never disagree. Returns the
+ * number of rows that fit; fills the list band and per-scroll arrow rects. */
+static int menu_geom(int my, int *list_top, int *list_bottom, int *arrow_x,
+                     int *up_y, int *down_y)
+{
+    int lt = my + MENU_LIST_TOP;
+    int lb = my + MENU_H - 8;
+    int vis = (lb - lt) / MENU_ROW_H;
+    if (vis < 1) vis = 1;
+    if (list_top)    *list_top = lt;
+    if (list_bottom) *list_bottom = lb;
+    if (arrow_x)     *arrow_x = 4 + MENU_W - MENU_ARROW_W - 4;
+    if (up_y)        *up_y = lt;
+    if (down_y)      *down_y = lb - 18;
+    return vis;
+}
+
+static void clamp_scroll(int count, int visible)
+{
+    int maxs = count - visible;
+    if (maxs < 0) maxs = 0;
+    if (menu_scroll > maxs) menu_scroll = maxs;
+    if (menu_scroll < 0) menu_scroll = 0;
+}
 
 static const char *APP_NAMES[] = {
-    "File Explorer", "Terminal", "Notepad", "Browser",
+    "File Explorer", "Terminal", "Code Editor", "Browser", "Settings",
     "Flappy Bird", "Pong", "Mario", "Maze 3D", "Tetris",
-    "Snake", "Breakout", "DOOM"
+    "Snake", "Breakout", "DOOM", "C Interpreter", "Python"
 };
-#define APP_COUNT 12
+#define APP_COUNT 15
 
 typedef struct {
     char label[40];
-    int  kind;   /* 0 = app, 1 = file */
+    int  kind;
     int  arg;
 } MenuItem;
 
@@ -91,14 +117,17 @@ static void launch_app(int index)
     case 1:  wm_create_terminal(170, 90, 520, 340); break;
     case 2:  wm_create_notepad(210, 120, 470, 320); break;
     case 3:  wm_create_browser(90, 60, 840, 620); break;
-    case 4:  wm_create_game(GAME_FLAPPY,   140, 70, 520, 560); break;
-    case 5:  wm_create_game(GAME_PONG,     120, 80, 660, 460); break;
-    case 6:  wm_create_game(GAME_MARIO,     80, 70, 820, 470); break;
-    case 7:  wm_create_game(GAME_RAYCAST,  130, 70, 680, 520); break;
-    case 8:  wm_create_game(GAME_TETRIS,   220, 50, 460, 640); break;
-    case 9:  wm_create_game(GAME_SNAKE,    160, 60, 560, 500); break;
-    case 10: wm_create_game(GAME_BREAKOUT, 150, 70, 620, 480); break;
-    case 11: wm_create_doom(70, 40, 656, 452); break;
+    case 4:  wm_create_settings(180, 80, 480, 470); break;
+    case 5:  wm_create_game(GAME_FLAPPY,   140, 70, 520, 560); break;
+    case 6:  wm_create_game(GAME_PONG,     120, 80, 660, 460); break;
+    case 7:  wm_create_game(GAME_MARIO,     80, 70, 820, 470); break;
+    case 8:  wm_create_game(GAME_RAYCAST,  130, 70, 680, 520); break;
+    case 9:  wm_create_game(GAME_TETRIS,   220, 50, 460, 640); break;
+    case 10: wm_create_game(GAME_SNAKE,    160, 60, 560, 500); break;
+    case 11: wm_create_game(GAME_BREAKOUT, 150, 70, 620, 480); break;
+    case 12: wm_create_doom(70, 40, 656, 452); break;
+    case 13: wm_create_interp(INTERP_C,  190, 70, 560, 420); break;
+    case 14: wm_create_interp(INTERP_PY, 210, 90, 560, 420); break;
     default: break;
     }
 }
@@ -129,7 +158,7 @@ static void draw_start_menu(void)
     int mx = 4, my = bar_y - MENU_H;
     color_t menu_bg = fb_rgb(36, 40, 54);
     color_t box_bg  = fb_rgb(245, 245, 250);
-    color_t accent  = fb_rgb(0, 120, 215);
+    color_t accent  = theme_accent();
 
     fb_fill_rect(mx - 2, my - 2, MENU_W + 4, MENU_H + 4, fb_rgb(16, 18, 26));
     fb_fill_rect(mx, my, MENU_W, MENU_H, menu_bg);
@@ -142,16 +171,32 @@ static void draw_start_menu(void)
     copy_bounded(shown, search_len == 0 ? "Search..." : search_text, 40);
     draw_text_clipped(sx + 6, sy + 3, shown, (sw - 12) / 8, fb_rgb(60, 60, 70), box_bg);
 
-    MenuItem items[64];
-    int count = build_menu_items(search_text, items, 64);
-    int list_y = my + 80;
-    for (int i = 0; i < count; i++) {
-        int row_y = list_y + i * 24;
-        if (row_y + 24 > my + MENU_H) break;
+    MenuItem items[128];
+    int count = build_menu_items(search_text, items, 128);
+
+    int list_top, list_bottom, arrow_x, up_y, down_y;
+    int visible = menu_geom(my, &list_top, &list_bottom, &arrow_x, &up_y, &down_y);
+    int scrollable = count > visible;
+    clamp_scroll(count, visible);
+
+    int text_cols = ((scrollable ? MENU_W - MENU_ARROW_W - 6 : MENU_W) - 44) / 8;
+    for (int r = 0; r < visible; r++) {
+        int i = menu_scroll + r;
+        if (i >= count) break;
+        int row_y = list_top + r * MENU_ROW_H;
         color_t bullet = items[i].kind == 0 ? accent : fb_rgb(150, 156, 168);
         fb_fill_rect(mx + 12, row_y + 3, 14, 14, bullet);
-        draw_text_clipped(mx + 34, row_y + 4, items[i].label, (MENU_W - 44) / 8,
+        draw_text_clipped(mx + 34, row_y + 4, items[i].label, text_cols,
                            fb_rgb(235, 235, 240), menu_bg);
+    }
+
+    if (scrollable) {
+        color_t up_c   = menu_scroll > 0            ? fb_rgb(220, 224, 232) : fb_rgb(96, 100, 112);
+        color_t down_c = menu_scroll < count - visible ? fb_rgb(220, 224, 232) : fb_rgb(96, 100, 112);
+        fb_fill_rect(arrow_x, up_y,   MENU_ARROW_W, 18, fb_rgb(52, 58, 76));
+        fb_fill_rect(arrow_x, down_y, MENU_ARROW_W, 18, fb_rgb(52, 58, 76));
+        gfx_text(arrow_x + 4, up_y   + 1, "^", up_c,   fb_rgb(52, 58, 76));
+        gfx_text(arrow_x + 4, down_y + 1, "v", down_c, fb_rgb(52, 58, 76));
     }
 }
 
@@ -161,10 +206,14 @@ void taskbar_paint(void)
     int bar_y = screen_h - BAR_H;
     color_t bar_bg = fb_rgb(20, 24, 36);
 
-    fb_fill_rect(0, bar_y, screen_w, BAR_H, bar_bg);
-    fb_fill_rect(0, bar_y, screen_w, 2, fb_rgb(0, 120, 215));   /* accent edge */
+    uint8_t ar, ag, ab; theme_accent_rgb(&ar, &ag, &ab);
+    color_t accent     = fb_rgb(ar, ag, ab);
+    color_t accent_dim = fb_rgb((uint8_t)(ar * 4 / 5), (uint8_t)(ag * 4 / 5), (uint8_t)(ab * 4 / 5));
 
-    color_t start_bg = menu_open ? fb_rgb(0, 100, 190) : fb_rgb(0, 120, 215);
+    fb_fill_rect(0, bar_y, screen_w, BAR_H, bar_bg);
+    fb_fill_rect(0, bar_y, screen_w, 2, accent);
+
+    color_t start_bg = menu_open ? accent_dim : accent;
     fb_fill_rect(0, bar_y, START_W, BAR_H, start_bg);
     draw_start_logo(14, bar_y + 12);
     gfx_text(40, bar_y + 12, "Start", fb_rgb(255, 255, 255), start_bg);
@@ -217,6 +266,7 @@ void taskbar_key(char c)
         search_text[search_len++] = c;
         search_text[search_len] = '\0';
     }
+    menu_scroll = 0;   /* filter changed: jump back to the top of the results */
 }
 
 int taskbar_click(int mx, int my)
@@ -224,18 +274,29 @@ int taskbar_click(int mx, int my)
     int screen_w = fb_width(), screen_h = fb_height();
     int bar_y = screen_h - BAR_H;
 
-    if (my >= bar_y && mx < START_W) { menu_open = !menu_open; return 1; }
+    if (my >= bar_y && mx < START_W) { menu_open = !menu_open; if (menu_open) menu_scroll = 0; return 1; }
 
     if (menu_open) {
         int menu_x = 4, menu_y = bar_y - MENU_H;
         if (mx >= menu_x && mx < menu_x + MENU_W && my >= menu_y && my < menu_y + MENU_H) {
-            MenuItem items[64];
-            int count = build_menu_items(search_text, items, 64);
-            int list_y = menu_y + 80;
-            for (int i = 0; i < count; i++) {
-                int row_y = list_y + i * 24;
-                if (row_y + 24 > menu_y + MENU_H) break;
-                if (my >= row_y && my < row_y + 24) {
+            MenuItem items[128];
+            int count = build_menu_items(search_text, items, 128);
+
+            int list_top, list_bottom, arrow_x, up_y, down_y;
+            int visible = menu_geom(menu_y, &list_top, &list_bottom, &arrow_x, &up_y, &down_y);
+            clamp_scroll(count, visible);
+            int scrollable = count > visible;
+
+            if (scrollable && mx >= arrow_x && mx < arrow_x + MENU_ARROW_W) {
+                if (my >= up_y   && my < up_y   + 18) { menu_scroll -= 3; clamp_scroll(count, visible); return 1; }
+                if (my >= down_y && my < down_y + 18) { menu_scroll += 3; clamp_scroll(count, visible); return 1; }
+            }
+
+            for (int r = 0; r < visible; r++) {
+                int i = menu_scroll + r;
+                if (i >= count) break;
+                int row_y = list_top + r * MENU_ROW_H;
+                if (my >= row_y && my < row_y + MENU_ROW_H) {
                     if (items[i].kind == 0) {
                         launch_app(items[i].arg);
                     } else {

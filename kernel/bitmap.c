@@ -46,7 +46,7 @@ int bmp_decode(const uint8_t *data, int len, Bitmap *out)
 
     if (planes != 1) return -4;
     if (!(bpp == 24 || bpp == 32)) return -5;
-    if (compression != 0) return -6; /* BI_RGB only, no RLE */
+    if (compression != 0) return -6;
 
     /* Negative height means the rows are stored top-down; positive means
      * bottom-up, which is BMP's usual (annoying) convention. */
@@ -105,7 +105,7 @@ void bmp_blit(const Bitmap *bmp, int dst_x, int dst_y, int max_w, int max_h)
         for (int x = 0; x < w; x++) {
             uint32_t px = bmp->pixels[y * bmp->stride + x];
             uint8_t a = (uint8_t)(px >> 24);
-            if (a < 16) continue; /* treat near-transparent as fully transparent */
+            if (a < 16) continue;
             uint8_t r = (uint8_t)(px >> 16);
             uint8_t g = (uint8_t)(px >> 8);
             uint8_t b = (uint8_t)(px);

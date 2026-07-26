@@ -56,6 +56,7 @@
 
 #define TX_SLOT_SIZE   2048
 #define TX_SLOT_COUNT  4
+#define TX_OWN         0x2000   /* TSD bit: chip sets it once it's done DMA-ing the slot */
 
 static Rtl8139Device g_card;
 static uint8_t *g_tx_slot[TX_SLOT_COUNT];
@@ -190,9 +191,23 @@ int rtl8139_send(const void *frame, uint16_t len)
     if (len > TX_SLOT_SIZE) return -2;
 
     uint8_t slot = g_card.tx_cur & (TX_SLOT_COUNT - 1);
+    uint16_t tsd = (uint16_t)(REG_TXSTATUS0 + slot * 4);
+
+    /* Only four descriptors, so a burst of sends can lap the ring while
+     * the chip is still DMA-ing this slot - and rewriting TXSTATUS mid-DMA
+     * is undefined. Spin (bounded, same style as ata.c) until the chip
+     * hands the slot back; on timeout drop the frame and let the caller's
+     * retry path deal with it rather than corrupt what's on the wire. */
+    int owned = 0;
+    for (int spins = 0; spins < 100000; spins++) {
+        if (get32(g_card.io_base, tsd) & TX_OWN) { owned = 1; break; }
+        io_wait();
+    }
+    if (!owned) return -3;
+
     kmemmove(g_tx_slot[slot], frame, len);
 
-    put32(g_card.io_base, (uint16_t)(REG_TXSTATUS0 + slot * 4), (uint32_t)len);
+    put32(g_card.io_base, tsd, (uint32_t)len);
     g_card.tx_cur = (uint8_t)((slot + 1) & (TX_SLOT_COUNT - 1));
     return len;
 }
@@ -221,7 +236,7 @@ int rtl8139_poll(void)
     while ((get8(g_card.io_base, REG_CHIPCMD) & CMD_BUFE) == 0) {
         uint8_t *hdr = g_card.rx_buf + g_rx_cursor;
         uint16_t status = (uint16_t)(hdr[0] | ((uint16_t)hdr[1] << 8));
-        uint16_t total_len = (uint16_t)(hdr[2] | ((uint16_t)hdr[3] << 8)); /* includes the trailing 4-byte CRC */
+        uint16_t total_len = (uint16_t)(hdr[2] | ((uint16_t)hdr[3] << 8));
 
         if (total_len == 0xFFFF) break; /* NIC is still DMA'ing this one in, come back later */
 
