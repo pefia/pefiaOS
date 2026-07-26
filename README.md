@@ -1,196 +1,225 @@
-# pefiaOS, press image below for showcase
+# pefiaOS
 
 [![Watch the showcase](https://img.youtube.com/vi/JEbIDeVyaeI/maxresdefault.jpg)](https://youtu.be/JEbIDeVyaeI)
 
-A bare-metal **32-bit x86 operating system**, written from scratch in freestanding
-C and NASM — no libc, no kernel dependencies. It boots via GRUB2 into protected
-mode, brings up a VESA framebuffer, and runs a mouse-driven **graphical desktop**
-with overlapping windows. On top of that it has a **from-scratch TCP/IP + TLS 1.3
-network stack and web browser** that loads real HTTPS sites, **seven built-in
-games**, and — yes — **the actual id Software DOOM**.
+A 32-bit x86 operating system written completely from scratch in freestanding C and NASM. It boots through GRUB2, enters protected mode, initializes a VESA framebuffer, and launches a graphical desktop with windows, networking, a web browser, games, and even the original DOOM.
 
-> Build: WSL2 Ubuntu + an `i686-elf` cross-compiler → `make` → a bootable
-> `pefiaOS.iso` for QEMU or VirtualBox.
+Everything apart from the bundled DOOM engine was written specifically for this project, including the networking stack, TLS implementation, browser, window manager, drivers, and desktop applications.
 
-## Highlights
+> Built in WSL2 Ubuntu using an `i686-elf` cross compiler. `make` produces a bootable ISO that runs in QEMU or VirtualBox.
 
-- **Boots to a graphical desktop** — window manager with z-order, drag-to-move,
-  drag-to-resize, drop shadows, a Start menu with live search, and a taskbar clock.
-- **From-scratch networking** — Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS and TCP,
-  driving Intel e1000 and Realtek RTL8139 NICs (auto-probed).
-- **Hand-written TLS 1.3** — X25519, AES-128-GCM, SHA-256/HKDF — so HTTPS sites
-  actually load.
-- **A web browser** — HTTP/1.1 with redirects + chunked decoding, an HTML5
-  renderer with links, lists, inline CSS colour, and inline images (BMP + JPEG
-  decoded by hand).
-- **Seven games** — Flappy Bird, Pong, a Mario-style platformer, a 3D raycaster
-  maze, Tetris, Snake, and Breakout — all flicker-free and resizable.
-- **It runs DOOM** — the real 1993 DOOM via [PureDOOM](https://github.com/Daivuk/PureDOOM),
-  with the shareware WAD embedded right in the kernel image.
+## Features
 
-All of it is roughly **9k lines of kernel C** plus the boot stub (and the vendored
-DOOM engine).
+### Desktop
 
-## Directory layout
+- Window manager with overlapping windows
+- Drag, resize, minimize and close windows
+- Taskbar with clock
+- Start menu with live search
+- Mouse support
+- Software rendered desktop with shadows
+
+### Networking
+
+The networking stack is written from scratch and includes:
+
+- Ethernet
+- ARP
+- IPv4
+- ICMP
+- UDP
+- DHCP
+- DNS
+- TCP
+
+Supports both Intel e1000 and Realtek RTL8139 network cards.
+
+### HTTPS
+
+pefiaOS includes its own TLS 1.3 client implementation supporting:
+
+- X25519 key exchange
+- HKDF
+- SHA-256
+- AES-128-GCM
+
+This allows the browser to load real HTTPS websites without relying on external libraries.
+
+### Browser
+
+The browser supports:
+
+- HTTP/1.1
+- HTTPS
+- Redirects
+- Chunked transfer encoding
+- HTML rendering
+- Headings
+- Lists
+- Links
+- Basic inline CSS colours
+- BMP and JPEG images
+- Scrolling
+
+It is intentionally simple and does not aim to support modern JavaScript-heavy websites.
+
+### Games
+
+Built-in games include:
+
+- Flappy Bird
+- Pong
+- Mario-style platformer
+- Maze 3D raycaster
+- Tetris
+- Snake
+- Breakout
+
+All games run inside resizable desktop windows.
+
+### DOOM
+
+pefiaOS also runs the original 1993 DOOM through PureDOOM.
+
+The shareware WAD is embedded directly into the kernel image, so no filesystem access is required. The operating system provides memory allocation, timing, keyboard input and file access required by the engine.
+
+## Project structure
 
 ```
 pefiaOS/
-├── Makefile                 # one-command build: `make`
-├── linker.ld                # kernel memory layout (load at 1 MiB)
-├── doom1.wad                # DOOM shareware IWAD (embedded into the image)
 ├── boot/
-│   ├── boot.asm             # Multiboot v1 header (requests a framebuffer) + _start
-│   └── doom_wad.asm         # incbin's doom1.wad into the kernel as read-only data
 ├── kernel/
-│   ├── kernel.c             # kernel_main: brings everything up, hands off to the WM
-│   ├── framebuffer.*, console.*, font8x16.h   # graphics + 8x16 text
-│   ├── input.*, mouse.*     # polled PS/2 keyboard + mouse, software cursor
-│   ├── heap.*, util.h, io.h # allocator + freestanding helpers + port I/O
-│   ├── vfs.*, rtc.*, clock.* # in-RAM filesystem, CMOS time, rdtsc millisecond clock
-│   ├── wm.*, taskbar.*      # window manager + desktop shell
-│   ├── explorer.*, terminal.*, notepad.*, shell.*   # desktop apps
-│   ├── pci.*, nic.*, e1000.*, rtl8139.*   # PCI + NIC drivers
-│   ├── netstack.*, net.*    # Ethernet→TCP stack + HTTP(S) fetch
-│   ├── crypto.*, tls.*      # SHA-256/HKDF/AES-GCM/X25519 + TLS 1.3 client
-│   ├── browser.*, htmlrender.*, css.*, domparse.*, domrt.*, js.*   # the browser
-│   ├── inflate.*, bitmap.*, jpeg.*, image.*   # DEFLATE + image decoders
-│   ├── games.*              # Flappy Bird, Pong, Mario, Maze 3D, Tetris, Snake, Breakout
-│   └── PureDOOM.h, puredoom.c, doom_app.*   # DOOM engine + pefiaOS platform layer
-├── iso/boot/grub/grub.cfg   # GRUB menu (multiboot /boot/pefiaos.bin)
-└── toolchain/
-    ├── build-i686-elf.sh    # builds the i686-elf cross-compiler
-    └── genfont.py           # regenerates kernel/font8x16.h from a PSF font
+├── iso/
+├── toolchain/
+├── Makefile
+├── linker.ld
+└── doom1.wad
 ```
 
-## Build (in WSL2 Ubuntu)
+Most kernel code lives inside `kernel/`.
 
-```sh
-# 1. One-time: deps for building the cross-compiler, fonts, and the ISO
+Some major components include:
+
+| Component | Description |
+|----------|-------------|
+| framebuffer | Graphics output |
+| wm | Window manager |
+| taskbar | Desktop shell |
+| browser | Web browser |
+| htmlrender | HTML renderer |
+| tls | TLS 1.3 implementation |
+| crypto | Cryptographic primitives |
+| netstack | TCP/IP networking |
+| e1000 / rtl8139 | Network drivers |
+| terminal | Shell |
+| notepad | Text editor |
+| explorer | File explorer |
+| games | Built-in games |
+
+## Building
+
+Install the required packages:
+
+```bash
 sudo apt update
-sudo apt install -y build-essential bison flex libgmp3-dev libmpc-dev \
-    libmpfr-dev texinfo wget nasm xorriso grub-pc-bin grub-common \
-    qemu-system-x86 kbd netpbm
 
-# 2. One-time: build the i686-elf cross-compiler (~20-40 min). Run from ~ .
+sudo apt install -y \
+build-essential \
+bison \
+flex \
+libgmp3-dev \
+libmpc-dev \
+libmpfr-dev \
+texinfo \
+wget \
+nasm \
+xorriso \
+grub-pc-bin \
+grub-common \
+qemu-system-x86 \
+kbd \
+netpbm
+```
+
+Build the cross compiler:
+
+```bash
 bash toolchain/build-i686-elf.sh
-echo 'export PATH="$HOME/opt/cross/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
 
-# 3. Build the OS
-cd /mnt/c/Users/ish/Desktop/pefiaOS
+Add it to your PATH:
+
+```bash
+echo 'export PATH="$HOME/opt/cross/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Build the operating system:
+
+```bash
 make
 ```
 
-This produces `pefiaOS.iso` in the project root. (`make clean` removes build
-artifacts; the build embeds `doom1.wad`, so the kernel image is a few MB.)
+This creates `pefiaOS.iso`.
 
-## Run
+## Running
 
-- **QEMU (quick test):** `make run` — attaches a NAT-networked RTL8139 NIC so the
-  browser can reach the real internet. `make run-net` also writes a `net.pcap`
-  capture for debugging.
-- **VirtualBox:** create a new VM (Type: Other, Version: Other/Unknown 32-bit),
-  no hard disk, attach `pefiaOS.iso` as the optical disc, and give it **≥256 MB
-  RAM** (DOOM wants room). Graphics Controller **VBoxVGA** (or VMSVGA) with VRAM
-  ≥16 MB so the 1024×768×32 framebuffer is available. Click into the window to
-  capture the mouse.
+Quickest option:
 
-  **Networking** (Settings → Network → Adapter 1):
-  - Enable Network Adapter, **Attached to: NAT**
-  - **Advanced → Adapter Type: Intel PRO/1000 MT Desktop (82540EM)**
-  - Cable Connected: checked
+```bash
+make run
+```
 
-  VirtualBox does not emulate an RTL8139, so the Intel e1000 adapter type is
-  required. pefiaOS auto-detects e1000 (VirtualBox) or RTL8139 (QEMU); PCnet and
-  virtio-net are not yet supported.
+This launches QEMU with NAT networking enabled.
 
-## Using the desktop
+VirtualBox is also supported using an Intel PRO/1000 (82540EM) adapter.
 
-- **Start menu** (bottom-left): launches every app and filters by typing.
-- **Move a window** by dragging its title bar; **resize** by dragging the grip in
-  its bottom-right corner; **close** with the red **X**; click any window to raise
-  it. Open windows appear as buttons on the taskbar.
+## Desktop applications
 
-## Networking + Browser
-
-Open **Browser** from the Start menu, type a URL (`https://` is assumed) and press
-Enter. The stack is entirely from-scratch:
-
-- **Drivers:** Intel e1000 + Realtek RTL8139, auto-probed (`nic.c`).
-- **Stack:** Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP (`netstack.c`).
-- **TLS 1.3:** X25519 + AES-128-GCM + SHA-256/HKDF, by hand (`crypto.c`, `tls.c`).
-- **HTTP/1.1:** redirects + chunked transfer decoding (`net.c`).
-- **Renderer:** word-wrapped HTML5 with headings, clickable links, lists, rules,
-  entity decoding, inline CSS colour, inline images, and scrolling
-  (`htmlrender.c`). JavaScript-heavy apps won't run, but static HTML/CSS,
-  `<noscript>`, and simple `document.write` output render.
-
-> Server certificates are **not** verified — pefiaOS reaches the web, it does not
-> authenticate it. Appropriate for a hobby OS, not for secrets.
-
-## Games
-
-Seven games launch from the Start menu — each runs in a resizable window and
-animates flicker-free via an off-screen buffer.
-
-| Game        | Controls |
-|-------------|----------|
-| Flappy Bird | **Space / Up / W** to flap |
-| Pong        | **Up/Down** or **W/S** (you vs. CPU) |
-| Mario       | **←/→** or **A/D** to run, **Space/Up/W** to jump |
-| Maze 3D     | **W/S** or **↑/↓** move, **A/D** or **←/→** turn (a from-scratch raycaster) |
-| Tetris      | **←/→** move, **Up/W** rotate, **Down/S** soft drop, **Space** hard drop |
-| Snake       | **Arrows** or **WASD** to steer, eat apples to grow |
-| Breakout    | **←/→** or **A/D** to move the paddle, **Space** to launch |
-
-After a game over, press **Space** to restart.
-
-## Yes, it runs DOOM
-
-The Start menu's **DOOM** entry runs **the actual id Software DOOM (1993)** — not a
-clone — via [PureDOOM](https://github.com/Daivuk/PureDOOM), a zero-dependency port
-of the original source. The freely-distributable shareware `doom1.wad` is embedded
-directly in the kernel image, so no disk or filesystem is needed. pefiaOS supplies
-DOOM's platform layer: memory → `kmalloc`, timing → `clock_ms`, a RAM-backed file
-layer over the embedded WAD, raw key up/down events, and a scancode → DOOM key
-mapping. DOOM's 320×200 framebuffer is scaled into the window each frame.
-
-Controls are the classics: **arrows** move/turn, **Ctrl** fire, **Space** use/open
-doors, **Alt** strafe, **Shift** run, number keys select weapons, **Esc** menu,
-**Enter** select.
-
-> No sound yet (there's no audio driver); savegames live in RAM for the session;
-> and since the engine keeps global state, DOOM is happiest opened once per boot.
+- Browser
+- File Explorer
+- Terminal
+- Notepad
+- DOOM
+- Seven built-in games
 
 ## Shell commands
 
-In the **Terminal** app: `help`, `about` (neofetch-style system info), `clear`,
-`echo TEXT`, `memtest` (heap stress test).
+The terminal currently includes commands such as:
 
-## Regenerating the font
+- help
+- about
+- clear
+- echo
+- memtest
 
-`kernel/font8x16.h` is generated from a Linux console PSF font:
+## Limitations
 
-```sh
-python3 toolchain/genfont.py     # writes kernel/font8x16.h
-```
+This is still a hobby operating system, so several things are intentionally unfinished.
 
-## Limitations (by design)
+- No virtual memory or paging
+- Cooperative multitasking
+- TLS certificates are not verified
+- Very limited JavaScript support
+- No USB support
+- In-memory filesystem
 
-- TLS doesn't verify certificates; the crypto isn't hardened or constant-time.
-- JavaScript isn't really executed (only trivial `document.write`).
-- No preemptive multitasking — the main loop is cooperative and busy-polls.
-- No sound, and no PIT/APIC timer (timing rides on `rdtsc`).
+These are all areas I'd like to improve in future versions.
 
-Each is a deliberate scope choice — and a clear next project.
+## Statistics
 
-## License & credits
+Approximately:
 
-pefiaOS is licensed under the **GNU GPL v2** (see [LICENSE](LICENSE)). It must be
-GPLv2 because it links the DOOM engine: **DOOM** is provided by
-[PureDOOM](https://github.com/Daivuk/PureDOOM), which is GPLv2 (derived from id
-Software's GPL-released DOOM source). The embedded [`doom1.wad`](doom1.wad) is the
-**official DOOM shareware** episode, which id Software permits to be freely
-redistributed; DOOM © id Software.
+- ~9,000 lines of kernel C
+- Freestanding C and NASM
+- 32-bit x86
+- Boots through GRUB2
+- Runs entirely without libc or an existing kernel
 
-The pefiaOS kernel, drivers, network stack, TLS, browser, and games are original
-work, AI was used for debugging, code explanation + comments and restructuring of code only. Full attribution is in [CREDITS.md](CREDITS.md).
+## Credits
+
+pefiaOS is licensed under **GPL v2** because it links against the GPL-licensed PureDOOM engine.
+
+The operating system itself, including the kernel, networking stack, browser, drivers, desktop environment and applications, was written by me.
+
+AI was used for debugging, explaining code, and occasionally restructuring code. Full attribution is available in `CREDITS.md`.
